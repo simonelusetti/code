@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -13,8 +13,6 @@ from torch.utils.data import DataLoader
 from transformers import AutoModel, AutoTokenizer
 from urllib.request import urlretrieve
 from conllu import parse_incr
-
-logger = logging.getLogger(__name__)
 
 ALIASES: dict[str, set[str]] = {
     "cnn_dailymail": {"cnn", "cnn_highlights", "cnn_dailymail"},
@@ -85,9 +83,9 @@ def dataset_path(
     name: str,
     split: str,
     dataset_config: dict = DATASETS_DEFAULT_CONFIG["wikiann"]
-) -> str:
+) -> Path:
     filename = dataset_filename(name, split, dataset_config)
-    return to_absolute_path(f"./data/cache/{filename}") 
+    return Path(to_absolute_path(f"./data/cache/{filename}"))
 
 
 def freeze_encoder(encoder: AutoModel) -> AutoModel:
@@ -155,7 +153,6 @@ def resolve_dataset(
             if not local.exists():
                 if not raw_dataset_path:
                     raise FileNotFoundError(f"Missing UD file {local}")
-                logger.info("Downloading UD %s split to %s", split, local)
                 urlretrieve(base_url + fname, local)
 
         def load_conllu(path: Path | str) -> list[dict[str, list]]:
@@ -270,24 +267,24 @@ def get_dataset(
     subset: int | float | None = None,
     rebuild: bool = False,
     shuffle: bool = False,
-    log: bool = True,
+    logger: Optional[logging.Logger] = None,
     max_length: int = 512,
     raw_dataset_path: Optional[str] = None,
 ) -> Dataset:
     name = canonical_name(name)
-    cache_path = dataset_path(
+    path = dataset_path(
         name,
         split,
         dataset_config=dataset_config,
     )
-    if cache_path.exists() and not rebuild:
-        if log:
-            logger.info("Loading cached dataset from %s", cache_path)
-        ds = load_from_disk(cache_path)
+    if path.exists() and not rebuild:
+        if logger is not None:
+            logger.info("Loading cached dataset from %s", path)
+        ds = load_from_disk(path)
         if shuffle and subset not in (None, 1.0):
             ds = subset_and_shuffle(ds, subset, shuffle=shuffle)
         return ds
-    if log:
+    if logger is not None:
         logger.info("Building dataset for %s/%s (subset=%s)", name, split, subset)
     ds = build_dataset(
         name=name,
@@ -299,8 +296,8 @@ def get_dataset(
         shuffle=shuffle,
         raw_dataset_path=raw_dataset_path,
     )
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    ds.save_to_disk(cache_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ds.save_to_disk(path)
     return ds
 
 
@@ -350,24 +347,23 @@ def collate(batch):
     }
 
 
-def initialize_dataloaders(cfg, log: bool = True):
-    train_cfg = cfg.data.train
-    eval_cfg = cfg.data.eval
-    dev_cfg = cfg.data.dev
-
-    tokenizer_name = cfg.bucket_model.sbert_model
+def initialize_dataloaders(cfg: dict,
+    logger: Optional[logging.Logger] = None,
+    tokenizer_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    device: str = "cpu",
+) -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
 
     def build_loader(split_cfg):
-        split = split_cfg.split
         ds = get_dataset(
             tokenizer_name=tokenizer_name,
             name=canonical_name(split_cfg.dataset),
-            split=split,
+            split=split_cfg.split,
             subset=split_cfg.subset,
             dataset_config=split_cfg.config,
-            rebuild=cfg.data.rebuild_ds,
+            rebuild=cfg.rebuild_ds,
             shuffle=split_cfg.shuffle,
-            log=log,
+            logger=logger,
+            max_length=cfg.max_length,
             raw_dataset_path=None,
         )
         return DataLoader(
@@ -375,16 +371,16 @@ def initialize_dataloaders(cfg, log: bool = True):
             batch_size=split_cfg.batch_size,
             collate_fn=collate,
             num_workers=split_cfg.num_workers,
-            pin_memory=(cfg.runtime.device == "cuda"),
+            pin_memory=(device == "cuda"),
             persistent_workers=(split_cfg.num_workers > 0),
             shuffle=split_cfg.shuffle,
         )
 
-    train_dl = build_loader(train_cfg)
-    eval_dl = build_loader(eval_cfg)
+    train_dl = build_loader(cfg.train)
+    eval_dl = build_loader(cfg.eval)
 
     dev_dl = None
-    if dev_cfg and dev_cfg.dataset:
-        dev_dl = build_loader(dev_cfg)
+    if cfg.dev.dataset is not None and cfg.dev.dataset:
+        dev_dl = build_loader(cfg.dev)
 
     return train_dl, eval_dl, dev_dl

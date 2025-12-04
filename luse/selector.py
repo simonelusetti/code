@@ -33,6 +33,6 @@ class RationaleSelectorModel(nn.Module):
         super().__init__()
         self.selector = Selector(int(embedding_dim))
 
-    def forward(self, embeddings, attention_mask):
+    def forward(self, embeddings, attention_mask=None):
         alpha, beta = self.selector(embeddings)
         return hardkuma_sample(alpha, beta)
