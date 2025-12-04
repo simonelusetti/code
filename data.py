@@ -28,7 +28,7 @@ DATASETS_DEFAULT_CONFIG = {
     "cnn_dailymail": {
         "version": "3.0.0",
         "field": "highlights",
-    }
+    },
     "conll2003": None,
 }
 
@@ -111,7 +111,7 @@ def resolve_dataset(
     name: str,
     split: str,
     dataset_config: dict = DATASETS_DEFAULT_CONFIG["wikiann"],
-    raw_dataset_path: Optional[str],
+    raw_dataset_path: Optional[str] = None,
 ) -> Tuple[Dataset, Callable]:
     name = canonical_name(name)
     raw_split_path = None

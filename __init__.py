@@ -1,0 +1,80 @@
+"""Lightweight utilities for dataset prep and rationale selection models."""
+
+__version__ = "0.1.0"
+
+from .data import (
+    canonical_name,
+    collate,
+    dataset_filename,
+    dataset_path,
+    initialize_dataloaders,
+    map_pos_to_group,
+    sanitize_fragment,
+    subset_and_shuffle,
+    build_dataset,
+    get_dataset,
+)
+from .log import (
+    TqdmLoggingHandler,
+    get_logger,
+    make_loss_table,
+    make_slot_table,
+    make_table,
+    should_disable_tqdm,
+)
+from .losses import balance_loss, entropy_loss, recon_loss
+from .selector import RationaleSelectorModel, Selector, hardkuma_sample
+from .utils import (
+    aggregate_product,
+    configure_runtime,
+    counts,
+    ensure_finite,
+    format_gold_spans,
+    freeze_encoder,
+    load_sbert,
+    merge_spans,
+    merge_subwords,
+    metrics_from_counts,
+    prepare_batch,
+    resolve_aggregate_fn,
+    sbert_encode,
+)
+
+__all__ = [
+    "__version__",
+    "aggregate_product",
+    "balance_loss",
+    "build_dataset",
+    "canonical_name",
+    "collate",
+    "configure_runtime",
+    "counts",
+    "dataset_filename",
+    "dataset_path",
+    "ensure_finite",
+    "format_gold_spans",
+    "freeze_encoder",
+    "get_dataset",
+    "get_logger",
+    "hardkuma_sample",
+    "initialize_dataloaders",
+    "load_sbert",
+    "make_loss_table",
+    "make_slot_table",
+    "make_table",
+    "map_pos_to_group",
+    "merge_spans",
+    "merge_subwords",
+    "metrics_from_counts",
+    "prepare_batch",
+    "RationaleSelectorModel",
+    "recon_loss",
+    "resolve_aggregate_fn",
+    "sanitize_fragment",
+    "Selector",
+    "sbert_encode",
+    "should_disable_tqdm",
+    "subset_and_shuffle",
+    "TqdmLoggingHandler",
+    "entropy_loss",
+]

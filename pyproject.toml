@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "code-utils"
+version = "0.1.0"
+description = "Utilities for dataset handling and rationale selector models."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch",
+    "datasets",
+    "dora-search",
+    "transformers",
+    "sentence-transformers",
+    "prettytable",
+    "tqdm",
+]
+
+[tool.setuptools]
+packages = ["code"]
+
+[tool.setuptools.package-dir]
+code = "."
