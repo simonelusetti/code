@@ -37,12 +37,27 @@ NER_FALSE_NAMES = {
     "conll2003": "O",
 }
 
+# POS → 3-class mapping
+POS_GROUP_MAP = {
+    "NOUN": 0,
+    "PROPN": 0,
+    "PRON": 0,  # THING
+    "VERB": 1,
+    "AUX": 1,
+    "ADV": 1,
+    "ADJ": 1,  # ACTION
+}
+
+
+def map_pos_to_group(pos: str) -> int:
+    return POS_GROUP_MAP.get(pos, 2)  # OTHER
+
 
 def sanitize_fragment(fragment: str) -> str:
     return fragment.replace("/", "-")
 
 
-def _canonical_name(name: str) -> str:
+def canonical_name(name: str) -> str:
     for canonical, aliases in ALIASES.items():
         if name == canonical or name in aliases:
             return canonical
@@ -54,7 +69,7 @@ def dataset_filename(
     split: str,
     dataset_config: dict = DATASETS_DEFAULT_CONFIG["wikiann"]
 ) -> str:
-    canonical = _canonical_name(name)
+    canonical = canonical_name(name)
     parts = [canonical, split]
     config_values = dataset_config.values()
     for value in config_values:
@@ -73,14 +88,14 @@ def dataset_path(
     return to_absolute_path(f"./data/cache/{filename}") 
 
 
-def _freeze_encoder(encoder: AutoModel) -> AutoModel:
+def freeze_encoder(encoder: AutoModel) -> AutoModel:
     encoder.eval()
     for param in encoder.parameters():
         param.requires_grad = False
     return encoder
 
 
-def _subset_and_shuffle(ds: Dataset, subset, shuffle: bool) -> Dataset:
+def subset_and_shuffle(ds: Dataset, subset, shuffle: bool) -> Dataset:
     if shuffle:
         ds = ds.shuffle(seed=42)
     if subset is None or subset == 1.0:
@@ -92,13 +107,13 @@ def _subset_and_shuffle(ds: Dataset, subset, shuffle: bool) -> Dataset:
     return ds
 
 
-def _resolve_dataset(
+def resolve_dataset(
     name: str,
     split: str,
     dataset_config: dict = DATASETS_DEFAULT_CONFIG["wikiann"],
     raw_dataset_path: Optional[str],
 ) -> Tuple[Dataset, Callable]:
-    name = _canonical_name(name)
+    name = canonical_name(name)
     raw_split_path = None
     if raw_dataset_path is not None:
         raw_split_path = Path(raw_dataset_path) / split
@@ -109,32 +124,51 @@ def _resolve_dataset(
         field = dataset_config["field"] or DATASETS_DEFAULT_CONFIG["cnn_dailymail"]["field"]
         ds = load_from_disk(str(raw_split_path)) if raw_split_path is not None else load_dataset("cnn_dailymail", field, split=split)
         target_field = field or "highlights"
-        text_fn = lambda x: x[target_field]
+        return ds, lambda x: x[target_field]
     elif name == "wikiann":
         config_name = dataset_config["language"] or DATASETS_DEFAULT_CONFIG["wikiann"]["language    "]
         ds = load_from_disk(str(raw_split_path)) if raw_split_path is not None else load_dataset("wikiann", config_name, split=split)
-        text_fn = lambda x: x["tokens"]
+        return ds, lambda x: x["tokens"]
     elif name == "conll2003":
-        ds = load_from_disk(str(raw_split_path)) if raw_split_path is not None else load_dataset("conll2003", revision="refs/convert/parquet", split=split)
-        text_fn = lambda x: x["tokens"]
+        ds = load_from_disk(str(raw_split_path)) if raw_split_path is not None else load_dataset("conll2003", split=split)
+        return ds, lambda x: x["tokens"]
     elif name == "ud":
-    # UD is already preprocessed and saved with input_ids, attention_mask, embeddings, labels
-        if raw_dataset_root is not None:
-            raw_split_path = Path(
-                to_absolute_path(str(Path(raw_dataset_root) / f"ud-{split}.pt"))
-            )
-        else:
-            # default location inside ./data/, but absolute like the others
-            raw_split_path = Path(
-                to_absolute_path(f"./data/ud-{split}.pt")
-            )
+        text_fn = lambda x: x["form"]
+        if raw_split_path is not None:
+            ds = load_from_disk(raw_split_path)
+            return ds, text_fn
 
-        if not raw_split_path.exists():
-            raise FileNotFoundError(f"UD dataset split not found at {raw_split_path}")
+        files = {
+            "train": "en_ewt-ud-train.conllu",
+            "validation": "en_ewt-ud-dev.conllu",
+            "test": "en_ewt-ud-test.conllu",
+        }
+        base_url = "https://raw.githubusercontent.com/UniversalDependencies/UD_English-EWT/master/"
 
-        ds = load_from_disk(str(raw_split_path))
-        # UD does not need text_fn; it already includes all final tensors
-        text_fn = None
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        split_paths: dict[str, Path] = {}
+        for split, fname in files.items():
+            local = cache_dir / fname
+            split_paths[split] = local
+            if not local.exists():
+                if not download_missing:
+                    raise FileNotFoundError(f"Missing UD file {local}")
+                logger.info("Downloading UD %s split to %s", split, local)
+                urlretrieve(base_url + fname, local)
+
+        def load_conllu(path: Path | str) -> list[dict[str, list]]:
+            sentences = []
+            with open(path, "r", encoding="utf-8") as f:
+                for sent in parse_incr(f):
+                    tokens = [tok["form"] for tok in sent]
+                    upos = [tok["upos"] for tok in sent]
+                    labels = [map_pos_to_group(p) for p in upos]
+                    sentences.append({"tokens": tokens, "labels": labels})
+            return sentences
+            
+        datasets_dict = {split: load_conllu(path) for split, path in split_paths.items()}
+        ds = DatasetDict({split: Dataset.from_list(data) for split, data in datasets_dict.items()})
+        return ds[split], text_fn
     else:
         raise ValueError(f"Unknown dataset name: {name}")
 
@@ -171,8 +205,19 @@ def encode_examples(
             "input_ids": np.asarray(enc["input_ids"], dtype=np.int64),
             "attention_mask": np.asarray(enc["attention_mask"], dtype=np.int64),
             "embeddings": out.last_hidden_state.squeeze(0).detach().cpu().to(torch.float32).numpy(),
-            "tokens": example.get("tokens", [])
+            "tokens": example.get("tokens", example["form"])
         }
+
+        if "labels" in example and split_into_words:
+            word_ids = enc.word_ids()
+            labels = tok["upos"]
+            aligned = []
+            for word_id in word_ids:
+                if word_id is None:
+                    aligned.append(0)
+                else:
+                    aligned.append(map_pos_to_group(p) for p in upos[word_id])
+            out_dict["factor_tags"] = np.asarray(aligned, dtype=np.int64)
 
         if "ner_tags" in example and split_into_words:
             word_ids = enc.word_ids()
@@ -192,27 +237,27 @@ def encode_examples(
 
 def build_dataset(
     name: str,
-    split: str,
-    tokenizer_name: str,
-    max_length: int,
-    subset=None,
-    shuffle: bool = False,
+    tokenizer_name: str = "sentence-transformers/all-MiniLM-L6-v2",
     dataset_config: dict = DATASETS_DEFAULT_CONFIG["wikiann"],
+    split: str = "train",
+    subset: int | float | None = None,
+    max_length: int = 512,
+    shuffle: bool = False,
     raw_dataset_path: Optional[str] = None,
 ) -> Tuple[Dataset, AutoTokenizer]:
-    name = _canonical_name(name)
-    full_ds, text_fn = _resolve_dataset(
+    name = canonical_name(name)
+    full_ds, text_fn = resolve_dataset(
         name=name,
         split=split,
         dataset_config=dataset_config,
         raw_dataset_root=raw_dataset_root,
         cnn_field=cnn_field,
     )
-    ds = _apply_subset_and_shuffle(full_ds, subset, shuffle=shuffle, log=log)
+    ds = apply_subset_and_shuffle(full_ds, subset, shuffle=shuffle, log=log)
     tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
     if name == "ud":
         return ds, tok
-    encoder = _freeze_encoder(AutoModel.from_pretrained(tokenizer_name))
+    encoder = freeze_encoder(AutoModel.from_pretrained(tokenizer_name))
     ds = encode_examples(name, ds, tok, encoder, text_fn, max_length)
     return ds, tok
 
@@ -222,15 +267,15 @@ def get_dataset(
     name: str = "wikiann",
     split: str = "train",
     dataset_config: dict = DATASETS_DEFAULT_CONFIG["wikiann"],
-    subset=None,
+    subset: int | float | None = None,
     rebuild: bool = False,
     shuffle: bool = False,
     log: bool = True,
     max_length: int = 512,
     raw_dataset_path: Optional[str] = None,
 ) -> Dataset:
-    name = _canonical_name(name)
-    cache_path = _dataset_cache_paths(
+    name = canonical_name(name)
+    cache_path = dataset_cache_paths(
         name,
         split,
         subset,
@@ -243,7 +288,7 @@ def get_dataset(
         ds = load_from_disk(cache_path)
         tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
         if shuffle and subset not in (None, 1.0):
-            ds = _subset_and_shuffle(ds, subset, shuffle=shuffle)
+            ds = subset_and_shuffle(ds, subset, shuffle=shuffle)
         return ds
     if log:
         logger.info("Building dataset for %s/%s (subset=%s)", name, split, subset)
@@ -281,38 +326,32 @@ def collate(batch):
         batch_first=True,
         padding_value=0,
     )
-
-    has_ner = "ner_tags" in batch[0]
-    if has_ner:
+    embeddings = pad_sequence(
+        tuple(_as_tensor(item["embeddings"], torch.float) for item in batch),
+        batch_first=True,
+        padding_value=0.0,
+    )
+    ner_tags = None
+    if "ner_tags" in batch[0]:
         ner_tags = pad_sequence(
             tuple(_as_tensor(item["ner_tags"], torch.long) for item in batch),
             batch_first=True,
             padding_value=-100,
         )
-
-    batch_out = {
-        "input_ids": input_ids,
-        "attention_mask": attention_masks,
-    }
-    if has_ner:
-        batch_out["ner_tags"] = ner_tags
-        
+    factor_tags = None
     if "labels" in batch[0]:
-        labels = pad_sequence(
+        factor_tags = pad_sequence(
             tuple(_as_tensor(item["labels"], torch.long) for item in batch),
             batch_first=True,
-            padding_value=2,   # OTHER
+            padding_value=2,  # OTHER
         )
-        batch_out["labels"] = labels
-
-    if "embeddings" in batch[0]:
-        embeddings = pad_sequence(
-            tuple(_as_tensor(item["embeddings"], torch.float) for item in batch),
-            batch_first=True,
-            padding_value=0.0,
-        )
-        batch_out["embeddings"] = embeddings
-    return batch_out
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_masks,
+        "factor_tags": factor_tags,
+        "ner_tags": ner_tags,
+        "embeddings": embeddings,
+    }
 
 
 def initialize_dataloaders(cfg, log: bool = True):
@@ -322,7 +361,7 @@ def initialize_dataloaders(cfg, log: bool = True):
 
     tokenizer_name = cfg.bucket_model.sbert_model
 
-    def _build_loader(split_cfg):
+    def build_loader(split_cfg):
         split = split_cfg.split
         ds = get_dataset(
             tokenizer_name=tokenizer_name,
@@ -345,11 +384,11 @@ def initialize_dataloaders(cfg, log: bool = True):
             shuffle=split_cfg.shuffle,
         )
 
-    train_dl = _build_loader(train_cfg)
-    eval_dl = _build_loader(eval_cfg)
+    train_dl = build_loader(train_cfg)
+    eval_dl = build_loader(eval_cfg)
 
     dev_dl = None
     if dev_cfg and dev_cfg.dataset:
-        dev_dl = _build_loader(dev_cfg)
+        dev_dl = build_loader(dev_cfg)
 
     return train_dl, eval_dl, dev_dl
