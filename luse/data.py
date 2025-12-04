@@ -6,11 +6,13 @@ from typing import Callable, Optional, Tuple
 
 import numpy as np
 import torch
-from datasets import Dataset, load_dataset, load_from_disk
+from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 from dora import to_absolute_path
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 from transformers import AutoModel, AutoTokenizer
+from urllib.request import urlretrieve
+from conllu import parse_incr
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +114,7 @@ def resolve_dataset(
     split: str,
     dataset_config: dict = DATASETS_DEFAULT_CONFIG["wikiann"],
     raw_dataset_path: Optional[str] = None,
-) -> Tuple[Dataset, Callable]:
+) -> Dataset:
     name = canonical_name(name)
     raw_split_path = None
     if raw_dataset_path is not None:
@@ -121,19 +123,19 @@ def resolve_dataset(
             raise FileNotFoundError(f"Raw dataset split not found at {raw_split_path}")
 
     if name == "cnn_dailymail":
-        field = dataset_config["field"] or DATASETS_DEFAULT_CONFIG["cnn_dailymail"]["field"]
-        ds = load_from_disk(str(raw_split_path)) if raw_split_path is not None else load_dataset("cnn_dailymail", field, split=split)
-        target_field = field or "highlights"
+        version = dataset_config["version"] or DATASETS_DEFAULT_CONFIG["cnn_dailymail"]["version"]
+        ds = load_from_disk(str(raw_split_path)) if raw_split_path is not None else load_dataset("cnn_dailymail", version, split=split)
+        target_field = dataset_config["field"] or DATASETS_DEFAULT_CONFIG["cnn_dailymail"]["field"]
         return ds, lambda x: x[target_field]
     elif name == "wikiann":
-        config_name = dataset_config["language"] or DATASETS_DEFAULT_CONFIG["wikiann"]["language    "]
+        config_name = dataset_config["language"] or DATASETS_DEFAULT_CONFIG["wikiann"]["language"]
         ds = load_from_disk(str(raw_split_path)) if raw_split_path is not None else load_dataset("wikiann", config_name, split=split)
         return ds, lambda x: x["tokens"]
     elif name == "conll2003":
         ds = load_from_disk(str(raw_split_path)) if raw_split_path is not None else load_dataset("conll2003", split=split)
         return ds, lambda x: x["tokens"]
     elif name == "ud":
-        text_fn = lambda x: x["form"]
+        text_fn = lambda x: x["tokens"]
         if raw_split_path is not None:
             ds = load_from_disk(raw_split_path)
             return ds, text_fn
@@ -145,13 +147,13 @@ def resolve_dataset(
         }
         base_url = "https://raw.githubusercontent.com/UniversalDependencies/UD_English-EWT/master/"
 
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        raw_dataset_path.mkdir(parents=True, exist_ok=True)
         split_paths: dict[str, Path] = {}
         for split, fname in files.items():
-            local = cache_dir / fname
+            local = raw_dataset_path / fname
             split_paths[split] = local
             if not local.exists():
-                if not download_missing:
+                if not raw_dataset_path:
                     raise FileNotFoundError(f"Missing UD file {local}")
                 logger.info("Downloading UD %s split to %s", split, local)
                 urlretrieve(base_url + fname, local)
@@ -169,10 +171,8 @@ def resolve_dataset(
         datasets_dict = {split: load_conllu(path) for split, path in split_paths.items()}
         ds = DatasetDict({split: Dataset.from_list(data) for split, data in datasets_dict.items()})
         return ds[split], text_fn
-    else:
-        raise ValueError(f"Unknown dataset name: {name}")
-
-    return ds, text_fn
+    
+    raise ValueError(f"Unknown dataset name: {name}")
 
 
 def encode_examples(
@@ -205,29 +205,30 @@ def encode_examples(
             "input_ids": np.asarray(enc["input_ids"], dtype=np.int64),
             "attention_mask": np.asarray(enc["attention_mask"], dtype=np.int64),
             "embeddings": out.last_hidden_state.squeeze(0).detach().cpu().to(torch.float32).numpy(),
-            "tokens": example.get("tokens", example["form"])
+            "tokens": text,
         }
 
         if "labels" in example and split_into_words:
             word_ids = enc.word_ids()
-            labels = tok["upos"]
+            labels = example["labels"]  # already token-level POS mapped to 0/1/2
             aligned = []
             for word_id in word_ids:
                 if word_id is None:
-                    aligned.append(0)
+                    aligned.append(2)  # OTHER
                 else:
-                    aligned.append(map_pos_to_group(p) for p in upos[word_id])
+                    aligned.append(int(labels[word_id]))
             out_dict["factor_tags"] = np.asarray(aligned, dtype=np.int64)
 
         if "ner_tags" in example and split_into_words:
             word_ids = enc.word_ids()
             ner_tags = example["ner_tags"]
             aligned = []
+            false_name = NER_FALSE_NAMES.get(name, "O")
             for word_id in word_ids:
                 if word_id is None:
                     aligned.append(0)
                 else:
-                    aligned.append(0 if NER_FALSE_NAMES["name"] == ner_tags[word_id] else 1)
+                    aligned.append(0 if false_name == ner_tags[word_id] else 1)
             out_dict["ner_tags"] = np.asarray(aligned, dtype=np.int64)
             
         return out_dict
@@ -250,16 +251,15 @@ def build_dataset(
         name=name,
         split=split,
         dataset_config=dataset_config,
-        raw_dataset_root=raw_dataset_root,
-        cnn_field=cnn_field,
+        raw_dataset_path=raw_dataset_path,
     )
-    ds = apply_subset_and_shuffle(full_ds, subset, shuffle=shuffle, log=log)
+    ds = subset_and_shuffle(full_ds, subset, shuffle=shuffle)
     tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
     if name == "ud":
-        return ds, tok
+        return ds
     encoder = freeze_encoder(AutoModel.from_pretrained(tokenizer_name))
     ds = encode_examples(name, ds, tok, encoder, text_fn, max_length)
-    return ds, tok
+    return ds
 
 
 def get_dataset(
@@ -275,33 +275,29 @@ def get_dataset(
     raw_dataset_path: Optional[str] = None,
 ) -> Dataset:
     name = canonical_name(name)
-    cache_path = dataset_cache_paths(
+    cache_path = dataset_path(
         name,
         split,
-        subset,
-        cnn_field=cnn_field,
         dataset_config=dataset_config,
     )
     if cache_path.exists() and not rebuild:
         if log:
             logger.info("Loading cached dataset from %s", cache_path)
         ds = load_from_disk(cache_path)
-        tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
         if shuffle and subset not in (None, 1.0):
             ds = subset_and_shuffle(ds, subset, shuffle=shuffle)
         return ds
     if log:
         logger.info("Building dataset for %s/%s (subset=%s)", name, split, subset)
-    ds, tok = build_dataset(
+    ds = build_dataset(
         name=name,
-        split=split,
         tokenizer_name=tokenizer_name,
-        max_length=max_length,
-        subset=subset,
-        shuffle=shuffle,
         dataset_config=dataset_config,
+        split=split,
+        subset=subset,
+        max_length=max_length,
+        shuffle=shuffle,
         raw_dataset_path=raw_dataset_path,
-        log=log,
     )
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     ds.save_to_disk(cache_path)
@@ -339,11 +335,11 @@ def collate(batch):
             padding_value=-100,
         )
     factor_tags = None
-    if "labels" in batch[0]:
+    if "factor_tags" in batch[0]:
         factor_tags = pad_sequence(
-            tuple(_as_tensor(item["labels"], torch.long) for item in batch),
+            tuple(_as_tensor(item["factor_tags"], torch.long) for item in batch),
             batch_first=True,
-            padding_value=2,  # OTHER
+            padding_value=-100,  # OTHER
         )
     return {
         "input_ids": input_ids,
@@ -365,7 +361,7 @@ def initialize_dataloaders(cfg, log: bool = True):
         split = split_cfg.split
         ds = get_dataset(
             tokenizer_name=tokenizer_name,
-            name=_canonical_name(split_cfg.dataset),
+            name=canonical_name(split_cfg.dataset),
             split=split,
             subset=split_cfg.subset,
             dataset_config=split_cfg.config,
