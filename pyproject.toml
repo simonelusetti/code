@@ -19,7 +19,4 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["code"]
-
-[tool.setuptools.package-dir]
-code = "."
+packages = ["code_utils"]

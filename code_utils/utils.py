@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import copy
 import os
 from typing import Any, Callable, Optional, Sequence, Tuple
@@ -5,6 +7,7 @@ from typing import Any, Callable, Optional, Sequence, Tuple
 import torch
 from torch import nn, Tensor
 from sentence_transformers import SentenceTransformer
+from transformers import AutoModel
 
 
 def resolve_aggregate_fn(
