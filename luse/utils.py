@@ -5,7 +5,6 @@ import os
 from typing import Any, Callable, Optional, Sequence, Tuple
 
 import torch
-from torch import nn, Tensor
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModel
 
@@ -215,10 +214,12 @@ def prepare_batch(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     embeddings = batch["embeddings"].to(device, non_blocking=True)
     attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-    input_ids = batch["input_ids"].to(device, non_blocking=True)
-    if "ner_tags" in batch:
-        return embeddings, attention_mask, input_ids, batch["ner_tags"].to(device, non_blocking=True)
-    return embeddings, attention_mask, input_ids, None
+    extra = {}
+    if batch["ner_tags"] is not None:
+        extra["ner_tags"] = batch["ner_tags"].to(device, non_blocking=True)
+    if batch["factor_tags"] is not None:
+        extra["factor_tags"] = batch["factor_tags"].to(device, non_blocking=True)
+    return embeddings, attention_mask, batch["tokens"], extra
 
 
 def load_sbert(
@@ -243,6 +244,7 @@ def sbert_encode(
     pooled = pooler(features)
     return pooled["sentence_embedding"] if isinstance(pooled, dict) else pooled
 
+
 def freeze_encoder(
     encoder: AutoModel,
 ) -> AutoModel:
@@ -250,3 +252,29 @@ def freeze_encoder(
     for param in encoder.parameters():
         param.requires_grad = False
     return encoder
+
+
+def wp_to_text(tokens: list[str]) -> str:
+    """Reconstruct text from BERT wordpieces."""
+    words = []
+    current = ""
+    for tok in tokens:
+        if tok.startswith("##"):
+            current += tok[2:]
+        else:
+            if current:
+                words.append(current)
+            current = tok
+    if current:
+        words.append(current)
+    return " ".join(words)
+
+
+def sbert_encode_texts(sbert, texts, device):
+    """
+    texts: list[str]
+    returns: torch.Tensor on device with shape [B, hidden_dim]
+    """
+    with torch.no_grad():
+        reps = sbert.encode(texts, convert_to_tensor=True, show_progress_bar=False)
+    return reps.to(device)

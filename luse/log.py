@@ -68,10 +68,10 @@ def make_table(
     return table
 
 
-def make_loss_table(
+def dict_to_table(
     losses: Mapping[str, float],
-    fields: Sequence[str],
 ) -> PrettyTable:
+    fields = losses.keys()
     rows = [[f"{losses.get(k, 0.0):.6f}" for k in fields]]
     return make_table(fields, rows)
 

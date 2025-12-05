@@ -5,11 +5,15 @@ from sentence_transformers import SentenceTransformer
 
 
 def hardkuma_sample(alpha, beta, eps=1e-6, u_min=1e-4):
+    """
+    Reparameterised sample from Kumaraswamy(alpha, beta) used for hard gates.
+    Uses the closed-form inverse CDF: x = (1 - (1 - u)^(1/beta))^(1/alpha).
+    """
     u = torch.rand_like(alpha).clamp(u_min, 1.0 - u_min)
-    log1m_u = torch.log1p(-u)
-    t = torch.exp((1.0 / (beta + eps)) * log1m_u)
-    one_minus_t = (1.0 - t).clamp(min=eps, max=1.0)
-    x = torch.exp((1.0 / (alpha + eps)) * torch.log(one_minus_t))
+    inv_alpha = 1.0 / (alpha + eps)
+    inv_beta = 1.0 / (beta + eps)
+    inner = 1.0 - torch.pow(1.0 - u, inv_beta)
+    x = torch.pow(inner.clamp(min=eps, max=1.0), inv_alpha)
     return x.clamp(eps, 1.0 - eps)
 
 
@@ -33,6 +37,22 @@ class RationaleSelectorModel(nn.Module):
         super().__init__()
         self.selector = Selector(int(embedding_dim))
 
-    def forward(self, embeddings, attention_mask=None):
-        alpha, beta = self.selector(embeddings)
-        return hardkuma_sample(alpha, beta)
+    def forward(self, embeddings, attention_mask=None, hard=True):
+        if attention_mask is not None:
+            embeddings = embeddings * attention_mask.unsqueeze(-1).float()
+
+        alpha, beta = self.selector(embeddings)  # [B, L], [B, L]
+        z = hardkuma_sample(alpha, beta)         # soft ∈ (0,1)
+
+        if hard:
+            # hard gate in forward, soft grad in backward
+            h = (z > 0.5).float()
+            gates = h + (z - z.detach())
+        else:
+            # pure soft gates
+            gates = z
+
+        if attention_mask is not None:
+            gates = gates * attention_mask.float()
+
+        return gates

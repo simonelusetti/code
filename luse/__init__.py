@@ -15,9 +15,9 @@ from .data import (
     get_dataset,
 )
 from .log import (
+    dict_to_table,
     TqdmLoggingHandler,
     get_logger,
-    make_loss_table,
     make_slot_table,
     make_table,
     should_disable_tqdm,
@@ -77,4 +77,5 @@ __all__ = [
     "subset_and_shuffle",
     "TqdmLoggingHandler",
     "entropy_loss",
+    "dict_to_table",
 ]
