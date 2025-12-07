@@ -216,9 +216,11 @@ def prepare_batch(
     attention_mask = batch["attention_mask"].to(device, non_blocking=True)
     extra = {}
     if batch["ner_tags"] is not None:
-        extra["ner_tags"] = batch["ner_tags"].to(device, non_blocking=True)
-    if batch["factor_tags"] is not None:
-        extra["factor_tags"] = batch["factor_tags"].to(device, non_blocking=True)
+        extra["ner_tags"] = batch["ner_tags"]
+    if batch["cath_tags"] is not None:
+        extra["cath_tags"] = batch["cath_tags"]
+    if batch["part_tags"] is not None:
+        extra["part_tags"] = batch["part_tags"]
     return embeddings, attention_mask, batch["tokens"], extra
 
 
@@ -236,14 +238,17 @@ def load_sbert(
 
 
 def sbert_encode(
-    pooler: torch.nn.Module,
+    sbert: SentenceTransformer,
     embeddings: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    features = {"token_embeddings": embeddings, "attention_mask": attention_mask}
-    pooled = pooler(features)
-    return pooled["sentence_embedding"] if isinstance(pooled, dict) else pooled
-
+    features = {
+        "token_embeddings": embeddings,
+        "attention_mask": attention_mask,
+    }
+    pooled = sbert[1](features)             # Pooling layer
+    pooled = sbert[2](pooled)               # Normalize layer
+    return pooled["sentence_embedding"] # Final embedding [B, H]
 
 def freeze_encoder(
     encoder: AutoModel,
@@ -278,3 +283,20 @@ def sbert_encode_texts(sbert, texts, device):
     with torch.no_grad():
         reps = sbert.encode(texts, convert_to_tensor=True, show_progress_bar=False)
     return reps.to(device)
+
+
+def format_dict(d, new_liners=None):
+    extra_newline_after = new_liners or set()
+    lines = []
+
+    for k, v in d.items():
+        # format numeric values to 5 decimal places
+        if isinstance(v, (int, float)):
+            v = f"{v:.5f}"
+
+        lines.append(f"{k}: {v}")
+
+        if k in extra_newline_after:
+            lines.append("")  # extra newline
+
+    return "\n".join(lines)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
@@ -40,20 +40,50 @@ NER_FALSE_NAMES = {
     "conll2003": "O",
 }
 
-# POS → 3-class mapping
 POS_GROUP_MAP = {
-    "NOUN": 0,
-    "PROPN": 0,
-    "PRON": 0,  # THING
-    "VERB": 1,
-    "AUX": 1,
-    "ADV": 1,
-    "ADJ": 1,   # ACTION
+    # -------------------
+    # THING (0)
+    # -------------------
+    "NOUN": "thing",
+    "PROPN": "thing",
+    "PRON": "thing",
+
+    # -------------------
+    # ACTION (1)
+    # -------------------
+    "VERB": "action",
+    "AUX": "action",
+    "ADV": "action",
+    "ADJ": "action",
+
+    # -------------------
+    # OTHER (2)
+    # -------------------
+    "ADP": "other",    # prepositions
+    "CONJ": "other",   # coordinating conjunctions (legacy tag)
+    "CCONJ": "other",  # UD: coordinating conjunctions
+    "SCONJ": "other",  # UD: subordinating conjunctions
+    "DET": "other",    # determiners
+    "INTJ": "other",   # interjections
+    "NUM": "other",    # numerals
+    "PART": "other",   # particles
+    "PUNCT": "other",  # punctuation
+    "SYM": "other",    # symbols
+    "X": "other",      # other/unclassified
 }
 
+PARTS = list(POS_GROUP_MAP.keys())
+CATHS = list(set(POS_GROUP_MAP.values()))
 
-def map_pos_to_group(pos: str) -> int:
-    return POS_GROUP_MAP.get(pos, 2)  # OTHER
+
+def map_pos_to_group(pos: str) -> str:
+    return POS_GROUP_MAP.get(pos, "other")
+
+
+PART_TO_ID = {tag: i for i, tag in enumerate(sorted(POS_GROUP_MAP.keys()))}
+PART_TO_ID["pad"] = len(PART_TO_ID)
+
+CATH_TO_ID = {"thing": 0, "action": 1, "other": 2, "pad": 3}
 
 
 # ---------------------------------------------------------------------------
@@ -136,13 +166,13 @@ def resolve_dataset(
             raise FileNotFoundError(f"Raw dataset split not found at {raw_split_path}")
 
     if name == "cnn_dailymail":
-        version = dataset_config.get("version") or DATASETS_DEFAULT_CONFIG["cnn_dailymail"]["version"]
+        version = dataset_config.get("version") if dataset_config is not None else DATASETS_DEFAULT_CONFIG["cnn_dailymail"]["version"]
         ds = load_from_disk(str(raw_split_path)) if raw_split_path is not None else load_dataset("cnn_dailymail", version, split=split)
-        target_field = dataset_config.get("field") or DATASETS_DEFAULT_CONFIG["cnn_dailymail"]["field"]
+        target_field = dataset_config.get("field") if dataset_config is not None else DATASETS_DEFAULT_CONFIG["cnn_dailymail"]["field"]
         return ds, lambda x: x[target_field]
 
     if name == "wikiann":
-        config_name = dataset_config.get("language") or DATASETS_DEFAULT_CONFIG["wikiann"]["language"]
+        config_name = dataset_config.get("language") if dataset_config is not None else DATASETS_DEFAULT_CONFIG["wikiann"]["language"]
         ds = load_from_disk(str(raw_split_path)) if raw_split_path is not None else load_dataset("wikiann", config_name, split=split)
         return ds, lambda x: x["tokens"]
 
@@ -179,9 +209,9 @@ def resolve_dataset(
             with open(path, "r", encoding="utf-8") as f:
                 for sent in parse_incr(f):
                     tokens = [tok["form"] for tok in sent]
-                    upos = [tok["upos"] for tok in sent]
-                    labels = [map_pos_to_group(p) for p in upos]
-                    sentences.append({"tokens": tokens, "labels": labels})
+                    part_labels = [tok["upos"] for tok in sent]
+                    cath_labels = [map_pos_to_group(pos) for pos in part_labels]
+                    sentences.append({"tokens": tokens, "cath_tags": cath_labels, "part_tags": part_labels})
             return sentences
 
         datasets_dict = {sp: load_conllu(path) for sp, path in split_paths.items()}
@@ -249,16 +279,22 @@ def encode_examples(
         }
 
         # POS / factor tags
-        if "labels" in example and split_into_words:
+        if "cath_tags" in example and split_into_words:
             word_ids = enc.word_ids()
-            labels = example["labels"]  # word-level labels 0/1/2
-            aligned = []
+            cath_labels = example["cath_tags"] 
+            part_labels = example["part_tags"]
+            aligned_cath = []
+            aligned_part = []
             for wid in word_ids:
                 if wid is None:
-                    aligned.append(2)  # OTHER
+                    aligned_cath.append("pad")  # OTHER
+                    aligned_part.append("pad")  # OTHER
                 else:
-                    aligned.append(int(labels[wid]))
-            out_dict["factor_tags"] = aligned  # List[int]
+                    aligned_cath.append(str(cath_labels[wid]))
+                    aligned_part.append(str(part_labels[wid]))
+                    
+            out_dict["cath_tags"] = aligned_cath  # List[int]
+            out_dict["part_tags"] = aligned_part  # List[int]
 
         # NER tags: binary entity vs non-entity
         if "ner_tags" in example and split_into_words:
@@ -371,6 +407,15 @@ def collate(batch):
         # value is list (nested or flat)
         return torch.tensor(value, dtype=dtype)
 
+    PAD_TAG = "<PAD_TAG>"
+
+    def pad_str_lists(list_of_lists, pad_value):
+        max_len = max(len(x) for x in list_of_lists)
+        return [
+            x + [pad_value] * (max_len - len(x))
+            for x in list_of_lists
+        ]
+
     input_ids = pad_sequence(
         [ _to_tensor(item["input_ids"], torch.long) for item in batch ],
         batch_first=True,
@@ -389,7 +434,6 @@ def collate(batch):
         padding_value=0.0,
     )
 
-    ner_tags = None
     if "ner_tags" in batch[0]:
         ner_tags = pad_sequence(
             [ _to_tensor(item["ner_tags"], torch.long) for item in batch ],
@@ -397,12 +441,24 @@ def collate(batch):
             padding_value=-100,  # ignore_index
         )
 
-    factor_tags = None
-    if "factor_tags" in batch[0]:
-        factor_tags = pad_sequence(
-            [ _to_tensor(item["factor_tags"], torch.long) for item in batch ],
-            batch_first=True,
-            padding_value=-100,  # OTHER / ignore_index
+    if "part_tags" in batch[0]:
+        raw_part = [item["part_tags"] for item in batch]
+        padded_part = pad_str_lists(raw_part, pad_value="pad")
+
+        part_tags = torch.tensor(
+            [[PART_TO_ID.get(tag, PART_TO_ID["pad"]) for tag in seq]
+             for seq in padded_part],
+            dtype=torch.long,
+        )
+
+    if "cath_tags" in batch[0]:
+        raw_cath = [item["cath_tags"] for item in batch]
+        padded_cath = pad_str_lists(raw_cath, pad_value="pad")
+
+        cath_tags = torch.tensor(
+            [[CATH_TO_ID.get(tag, CATH_TO_ID["pad"]) for tag in seq]
+             for seq in padded_cath],
+            dtype=torch.long,
         )
 
     tokens = [item["tokens"] for item in batch]  # list[list[str]]
@@ -410,10 +466,11 @@ def collate(batch):
     return {
         "input_ids": input_ids,
         "attention_mask": attention_masks,
-        "factor_tags": factor_tags,
-        "ner_tags": ner_tags,
         "embeddings": embeddings,
         "tokens": tokens,
+        "ner_tags": ner_tags if "ner_tags" in batch[0] else None,
+        "cath_tags": cath_tags if "cath_tags" in batch[0] else None,
+        "part_tags": part_tags if "part_tags" in batch[0] else None,
     }
 
 
