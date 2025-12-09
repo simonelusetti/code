@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import copy
 import os
-from typing import Any, Callable, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import torch
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModel
 
+from .data import CATH_TO_ID, PART_TO_ID_BY_SYSTEM, canonical_name
 
 def resolve_aggregate_fn(
     name: str,
@@ -164,6 +165,7 @@ def configure_runtime(
 ) -> None:
     runtime = cfg.runtime
     num_threads = runtime.num_threads
+    os.environ["TOKEN_PARALLELISM"] = str(runtime.token_parallelism)
     if not num_threads:
         return
     try:
@@ -290,13 +292,116 @@ def format_dict(d, new_liners=None):
     lines = []
 
     for k, v in d.items():
-        # format numeric values to 5 decimal places
         if isinstance(v, (int, float)):
             v = f"{v:.5f}"
-
         lines.append(f"{k}: {v}")
-
         if k in extra_newline_after:
-            lines.append("")  # extra newline
+            lines.append("") 
 
     return "\n".join(lines)
+
+
+class Counts(dict):
+    def __init__(
+        self, 
+        classes: list,
+        pad: int,
+        classes_str: dict | None = None,
+        classes_mask: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+    ) -> None:
+        super().__init__()
+        self.data = {}
+        self.pad = pad
+        self.classes = classes
+        self.classes_str = classes_str
+        if classes_mask is None:
+            for c in self.classes:
+                if c != self.pad:
+                    self.data[c] = 0
+        else:
+            for c in self.classes:
+                if c != self.pad:
+                    self.data[c] = ((classes_mask == c) & mask).sum().item()
+
+    def __add__(self, other: Counts) -> Counts:
+        if not isinstance(other, Counts):
+            raise ValueError("Can only add Counts to Counts.")
+
+        result = Counts(self.classes, self.pad, classes_str=self.classes_str)
+        for c in self.classes:
+            if c != self.pad:
+                result.data[c] = self.data[c] + other.data[c]
+        return result
+    
+    def __truediv__(self, other: Counts) -> Counts:
+        if not isinstance(other, Counts):
+            raise ValueError("Can only divide Counts by Counts.")
+
+        result = Counts(self.classes, self.pad, classes_str=self.classes_str)
+        for c in self.classes:
+            if c != self.pad:
+                if other.data[c] == 0:
+                    result.data[c] = 0.0
+                else:
+                    result.data[c] = self.data[c] / other.data[c]
+        return result
+    
+    def __str__(self) -> str:
+        data_dict = {
+            **{f"{k}": v for k, v in self.data.items()},
+        }
+        sorted_dict = dict(sorted(data_dict.items(), key=lambda x: x[1], reverse=True))
+        if self.classes_str is not None:
+            sorted_dict = {self.classes_str[int(id_)]: value for id_, value in sorted_dict.items()}
+        return format_dict(sorted_dict)
+    
+    def preferences_over_total(self, total: int) -> Counts:
+        result = Counts(self.classes, self.pad, classes_str=self.classes_str)
+        for c in self.classes:
+            if c != self.pad:
+                result.data[c] = self.data[c] / total if total > 0 else 0.0
+        return result
+    
+    def preferences(self) -> Counts:
+        result = Counts(self.classes, self.pad, classes_str=self.classes_str)
+        total = sum(self.data[c] for c in self.classes if c != self.pad)
+        for c in self.classes:
+            if c != self.pad:
+                result.data[c] = self.data[c] / total if total > 0 else 0.0
+        return result
+    
+def new_counts(
+        dataset_name: str,
+        gates: torch.Tensor,
+        attention_mask: torch.Tensor,
+        extra: Dict,
+        local_part_to_id: Dict,
+        device: torch.device,
+        cath_str: dict, 
+        part_str: dict,
+    ) -> Tuple[Counts, Counts, Counts, Counts, int]:
+        PAD_CATH = CATH_TO_ID["pad"]
+        PAD_PART = local_part_to_id["pad"]
+        local_part_to_id = PART_TO_ID_BY_SYSTEM[
+            canonical_name(dataset_name)
+        ]
+
+        # flatten
+        attn = attention_mask.bool().view(-1)
+        preds = (gates > 0.5).bool().view(-1)
+
+        # integer tensors, shape (B, L)
+        cath_tags = extra["cath_tags"].to(device)
+        part_tags = extra["part_tags"].to(device)
+
+        flat_cath = cath_tags.view(-1)
+        flat_part = part_tags.view(-1)
+
+        new_gold_cath = Counts(CATH_TO_ID.values(), PAD_CATH, classes_mask=flat_cath, mask=attn, classes_str=cath_str)
+        new_pred_cath = Counts(CATH_TO_ID.values(), PAD_CATH, classes_mask=flat_cath, mask=attn & preds, classes_str=cath_str)
+
+        new_gold_part = Counts(local_part_to_id.values(), PAD_PART, classes_mask=flat_part, mask=attn, classes_str=part_str)
+        new_pred_part = Counts(local_part_to_id.values(), PAD_PART, classes_mask=flat_part, mask=attn & preds, classes_str=part_str)
+        
+        return new_pred_cath, new_gold_cath, new_pred_part, new_gold_part, preds.sum().item()

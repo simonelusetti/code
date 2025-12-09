@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+import logging, gzip, nltk
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
@@ -12,6 +12,8 @@ from torch.utils.data import DataLoader
 from transformers import AutoModel, AutoTokenizer
 from urllib.request import urlretrieve
 from conllu import parse_incr
+from nltk.corpus import brown, treebank
+
 
 # ---------------------------------------------------------------------------
 # Constants & mappings
@@ -20,8 +22,11 @@ from conllu import parse_incr
 ALIASES: dict[str, set[str]] = {
     "cnn_dailymail": {"cnn", "cnn_highlights", "cnn_dailymail"},
     "wikiann": {"wikiann", "wikiann_en"},
-    "conll2003": {"conll2003", "conll"},
+    "conll2003": {"conll2003", "conll03"},
+    "conll2000": {"conll2000", "chunking", "conll00"},
     "ud": {"ud"},
+    "brown": {"brown"},
+    "treebank": {"treebank", "tb"},
 }
 
 DATASETS_DEFAULT_CONFIG = {
@@ -32,59 +37,147 @@ DATASETS_DEFAULT_CONFIG = {
         "version": "3.0.0",
         "field": "highlights",
     },
+    "ud": None,
     "conll2003": None,
+    "conll2000": None,
+    "brown": None,
+    "treebank": None,
 }
+
+ALIASES["nps_chat"] = {"nps_chat","nps","chat","npschat"}
+DATASETS_DEFAULT_CONFIG["nps_chat"] = None
 
 NER_FALSE_NAMES = {
     "wikiann": "O",
     "conll2003": "O",
 }
 
-POS_GROUP_MAP = {
-    # -------------------
-    # THING (0)
-    # -------------------
+USES_SYSTEM = {"ud", "conll2000", "brown", "treebank", "nps_chat"}
+
+POS_SYSTEMS = {
+    "ud": {
+        "NOUN": "thing", "PROPN": "thing", "PRON": "thing",
+        "VERB": "action", "AUX": "action",
+        "ADJ": "thing", "ADV": "action",
+        "ADP": "syntax", "DET": "thing", "CCONJ": "syntax", "SCONJ": "syntax",
+        "NUM": "thing", "PART": "syntax", "PUNCT": "syntax", "SYM": "symbol",
+        "_": "syntax",  "INTJ": "other", "X": "other",
+    },
+
+    "spacy": {
+        "NOUN": "thing", "PROPN": "thing", "PRON": "thing",
+        "VERB": "action", "AUX": "action",
+        "ADJ": "action", "ADV": "action",
+        "ADP": "other", "DET": "other", "CCONJ": "other",
+    },
+}
+
+POS_SYSTEMS["conll2000"] = {
+    # THINGS
+    "NN": "thing", "NNS": "thing", "NNP": "thing", "NNPS": "thing",
+    "PRP": "thing", "PRP$": "thing",
+    "WP": "thing", "WP$": "thing",
+
+    # ACTIONS
+    "VB": "action", "VBD": "action", "VBG": "action",
+    "VBN": "action", "VBP": "action", "VBZ": "action",
+    "JJ": "action", "JJR": "action", "JJS": "action",
+    "RB": "action", "RBR": "action", "RBS": "action",
+    "WRB": "action",
+
+    # SYNTAX (true function words)
+    "IN": "syntax",
+    "DT": "syntax",
+    "PDT": "syntax",
+    "CC": "syntax",
+    "MD": "syntax",
+    "POS": "syntax",
+    "RP": "syntax",
+    "TO": "syntax",
+    "WDT": "syntax",
+    "``": "syntax", "''": "syntax",
+    ",": "syntax", ".": "syntax", ":": "syntax",
+    "(": "syntax", ")": "syntax",
+    "#": "syntax", "$": "syntax",
+
+    # OTHER (not syntax)
+    "CD": "other",
+    "EX": "other",
+    "FW": "other",
+    "LS": "other",
+    "SYM": "other",
+    "UH": "other",
+}
+
+POS_SYSTEMS["treebank"] = POS_SYSTEMS["conll2000"]
+POS_SYSTEMS["treebank"]["-NONE-"] = "other"
+POS_SYSTEMS["treebank"]["-LRB-"] = "syntax"
+POS_SYSTEMS["treebank"]["-RRB-"] = "syntax"
+POS_SYSTEMS["treebank"]["-LCB-"] = "syntax"
+POS_SYSTEMS["treebank"]["-RCB-"] = "syntax"
+
+POS_SYSTEMS["brown"] = {
     "NOUN": "thing",
     "PROPN": "thing",
     "PRON": "thing",
 
-    # -------------------
-    # ACTION (1)
-    # -------------------
     "VERB": "action",
     "AUX": "action",
-    "ADV": "action",
-    "ADJ": "action",
 
-    # -------------------
-    # OTHER (2)
-    # -------------------
-    "ADP": "other",    # prepositions
-    "CONJ": "other",   # coordinating conjunctions (legacy tag)
-    "CCONJ": "other",  # UD: coordinating conjunctions
-    "SCONJ": "other",  # UD: subordinating conjunctions
-    "DET": "other",    # determiners
-    "INTJ": "other",   # interjections
-    "NUM": "other",    # numerals
-    "PART": "other",   # particles
-    "PUNCT": "other",  # punctuation
-    "SYM": "other",    # symbols
-    "X": "other",      # other/unclassified
+    "ADJ": "action",
+    "ADV": "action",
+
+    "ADP": "syntax",   # prepositions
+    "CONJ": "syntax",  # coordinating conjunctions
+    "SCONJ": "syntax", # subordinating conjunctions
+    "PART": "syntax",  # particles
+    "DET": "thing",    # keep like your UD mapping
+    "NUM": "thing",
+
+    "PUNCT": "syntax",
+    "PRT": "syntax",
+    ".": "syntax",
+    "SYM": "other",
+    "INTJ": "other",
+    "X": "other",
 }
 
-PARTS = list(POS_GROUP_MAP.keys())
-CATHS = list(set(POS_GROUP_MAP.values()))
+POS_SYSTEMS["nps_chat"] = {
+    **POS_SYSTEMS["conll2000"],       # reuse existing mapping
+    "EMO": "other",                    # emoticons (e.g. ":)"; appears in NPS)
+    "URL": "other",                     # URLs (appears in NPS)
+    "^NNS": "other",  
+    "^NN": "other",
+    "BES": "other",
+    "^VB": "other",
+    "^RB": "other",
+    "^VBZ": "other",      
+    "^VBP": "other",     
+    "^VBG": "other", 
+}
+UNKNOWN_POS = set()
 
+PART_TO_ID_BY_SYSTEM = {}
+CATH_TO_ID = {"thing": 0, "action": 1, "other": 2, "syntax": 3, "pad": 4}
 
-def map_pos_to_group(pos: str) -> str:
-    return POS_GROUP_MAP.get(pos, "other")
+ID_TO_CATH = {idx: tag for tag, idx in CATH_TO_ID.items()}
 
+for system_name, mapping in POS_SYSTEMS.items():
+    tags = sorted(mapping.keys())
+    local_map = {tag: i for i, tag in enumerate(tags)}
+    local_map["pad"] = len(local_map)
+    PART_TO_ID_BY_SYSTEM[system_name] = local_map
 
-PART_TO_ID = {tag: i for i, tag in enumerate(sorted(POS_GROUP_MAP.keys()))}
-PART_TO_ID["pad"] = len(PART_TO_ID)
+ID_TO_PART_BY_SYSTEM = {
+    system: {idx: tag for tag, idx in tag_to_id.items()}
+    for system, tag_to_id in PART_TO_ID_BY_SYSTEM.items()
+}
 
-CATH_TO_ID = {"thing": 0, "action": 1, "other": 2, "pad": 3}
-
+def map_pos_to_group(pos: str, system: str) -> str:
+    mapping = POS_SYSTEMS.get(system, {})
+    if pos in mapping:
+        return mapping[pos]
+    UNKNOWN_POS.add((system, pos))
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -132,7 +225,7 @@ def freeze_encoder(encoder: AutoModel) -> AutoModel:
     return encoder
 
 
-def subset_and_shuffle(ds: Dataset, subset, shuffle: bool) -> Dataset:
+def subset_and_shuffle(ds: Dataset, subset: int | float = 1.0, shuffle: bool = False) -> Dataset:
     if shuffle:
         ds = ds.shuffle(seed=42)
     if subset is None or subset == 1.0:
@@ -141,6 +234,45 @@ def subset_and_shuffle(ds: Dataset, subset, shuffle: bool) -> Dataset:
     if target_subset <= 0:
         raise ValueError(f"Requested subset {subset} results in 0 examples.")
     return ds.select(range(target_subset))
+
+
+def load_nltk_pos_corpus(
+    corpus_name: str,
+    corpus_loader: Callable[[], list[list[tuple[str, str]]]],
+    pos_system: str,
+) -> Dataset:
+    """
+    Generic loader for NLTK POS-tagged corpora.
+    Args:
+        corpus_name: name to show in errors / download messages
+        corpus_loader: function that returns a list of tagged sentences:
+                       e.g. lambda: brown.tagged_sents(tagset="universal")
+        pos_system: key into POS_SYSTEMS (e.g. "brown", "treebank", "nps_chat")
+    Returns:
+        A HuggingFace Dataset with {tokens, part_tags, cath_tags}
+    """
+    import nltk
+    try:
+        tagged = corpus_loader()
+        if not tagged:
+            raise LookupError
+    except LookupError:
+        nltk.download(corpus_name)
+        tagged = corpus_loader()
+
+    sentences = []
+    for sent in tagged:
+        tokens = [w for (w, _) in sent]
+        pos_tags = [t for (_, t) in sent]
+        cath_tags = [map_pos_to_group(t, pos_system) for t in pos_tags]
+
+        sentences.append({
+            "tokens": tokens,
+            "part_tags": pos_tags,
+            "cath_tags": cath_tags,
+        })
+
+    return Dataset.from_list(sentences)
 
 
 # ---------------------------------------------------------------------------
@@ -210,14 +342,95 @@ def resolve_dataset(
                 for sent in parse_incr(f):
                     tokens = [tok["form"] for tok in sent]
                     part_labels = [tok["upos"] for tok in sent]
-                    cath_labels = [map_pos_to_group(pos) for pos in part_labels]
-                    sentences.append({"tokens": tokens, "cath_tags": cath_labels, "part_tags": part_labels})
+                    cath_labels = [map_pos_to_group(pos, "ud") for pos in part_labels]
+                    sentences.append({
+                        "tokens": tokens,
+                        "cath_tags": cath_labels,
+                        "part_tags": part_labels
+                    })
             return sentences
 
         datasets_dict = {sp: load_conllu(path) for sp, path in split_paths.items()}
         ds = DatasetDict({sp: Dataset.from_list(data) for sp, data in datasets_dict.items()})
         return ds[split], text_fn
+    
+    if name == "conll2000":
+        # Download  
+        base_url = "https://www.clips.uantwerpen.be/conll2000/chunking/"
+        files = {
+            "train": "train.txt.gz",
+            "validation": "test.txt.gz",
+            "test": "test.txt.gz",
+        }
+        raw_root = Path(to_absolute_path("./data/raw/conll2000"))
+        raw_root.mkdir(parents=True, exist_ok=True)
+        gz_path = raw_root / files[split]
+        txt_path = raw_root / files[split].replace(".gz", "")
+        if not gz_path.exists():
+            urlretrieve(base_url + files[split], gz_path)
+        if not txt_path.exists():
+            with gzip.open(gz_path, "rt", encoding="utf-8") as f_in, \
+                 open(txt_path, "w", encoding="utf-8") as f_out:
+                for line in f_in:
+                    f_out.write(line)
+        # Parse
+        def _format_sentence(tokens, pos_tags):
+            cath = [map_pos_to_group(p, "conll2000") for p in pos_tags]
+            return{
+                "tokens": tokens,
+                "part_tags": pos_tags,
+                "cath_tags": cath,
+            }
+            
+        tokens, pos_tags, sentences = [], [], []
+        with open(txt_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    if len(tokens) == 0:
+                        raise ValueError("Empty sentence detected in CoNLL-2000 file.")
+                    sentences.append(_format_sentence(tokens, pos_tags))
+                    tokens, pos_tags = [], []
+                    continue
+                parts = line.split()
+                if len(parts) != 3:
+                    raise ValueError(f"Invalid CoNLL-2000 line (expected 3 columns): {line}")
+                word, pos, _ = parts
+                tokens.append(word)
+                pos_tags.append(pos)
+        if len(tokens) > 0:
+            sentences.append(_format_sentence(tokens, pos_tags))
 
+        ds = Dataset.from_list(sentences)
+        return ds, lambda x: x["tokens"]
+    
+    if name == "brown":
+        from nltk.corpus import brown
+        ds = load_nltk_pos_corpus(
+            corpus_name="brown",
+            corpus_loader=lambda: brown.tagged_sents(tagset="universal"),
+            pos_system="brown",
+        )
+        return ds, lambda x: x["tokens"]
+
+    if name == "treebank":
+        from nltk.corpus import treebank
+        ds = load_nltk_pos_corpus(
+            corpus_name="treebank",
+            corpus_loader=lambda: treebank.tagged_sents(),
+            pos_system="treebank",
+        )
+        return ds, lambda x: x["tokens"]
+
+    if name == "nps_chat":
+        from nltk.corpus import nps_chat
+        ds = load_nltk_pos_corpus(
+            corpus_name="nps_chat",
+            corpus_loader=lambda: nps_chat.tagged_posts(),
+            pos_system="nps_chat",
+        )
+        return ds, lambda x: x["tokens"]
+    
     raise ValueError(f"Unknown dataset name: {name}")
 
 
@@ -335,6 +548,11 @@ def build_dataset(
         dataset_config=dataset_config,
         raw_dataset_path=raw_dataset_path,
     )
+    
+    if not bool(UNKNOWN_POS):
+        unknown_list = sorted(list(UNKNOWN_POS))
+        raise ValueError(f"Unknown POS tags encountered: {unknown_list}")
+    
     ds = subset_and_shuffle(full_ds, subset, shuffle=shuffle)
 
     tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
@@ -348,7 +566,7 @@ def get_dataset(
     tokenizer_name: str = "sentence-transformers/all-MiniLM-L6-v2",
     name: str = "wikiann",
     split: str = "train",
-    dataset_config: dict = DATASETS_DEFAULT_CONFIG["wikiann"],
+    dataset_config: dict | None = None,
     subset: int | float | None = None,
     rebuild: bool = False,
     shuffle: bool = False,
@@ -358,13 +576,14 @@ def get_dataset(
 ) -> Dataset:
     name = canonical_name(name)
     path = dataset_path(name, split, dataset_config=dataset_config)
+    if dataset_config is None:
+        dataset_config = DATASETS_DEFAULT_CONFIG[name]
 
     if path.exists() and not rebuild:
         if logger is not None:
             logger.info("Loading cached dataset from %s", path)
         ds = load_from_disk(path)
-        if shuffle and subset not in (None, 1.0):
-            ds = subset_and_shuffle(ds, subset, shuffle=shuffle)
+        ds = subset_and_shuffle(ds, subset, shuffle=shuffle)
         return ds
 
     if logger is not None:
@@ -389,7 +608,7 @@ def get_dataset(
 # Collate function (everything tensorized here)
 # ---------------------------------------------------------------------------
 
-def collate(batch):
+def collate(batch, system: str | None = None) -> dict[str, torch.Tensor | list[list[str]]]:
     """
     batch: list[dict]
     Returns tensors:
@@ -442,12 +661,17 @@ def collate(batch):
         )
 
     if "part_tags" in batch[0]:
+        if system is None:
+            raise ValueError("POS-tagged dataset but no pos_system provided by dataloader")
+
+        local_map = PART_TO_ID_BY_SYSTEM[system]
+
         raw_part = [item["part_tags"] for item in batch]
         padded_part = pad_str_lists(raw_part, pad_value="pad")
 
         part_tags = torch.tensor(
-            [[PART_TO_ID.get(tag, PART_TO_ID["pad"]) for tag in seq]
-             for seq in padded_part],
+            [[local_map.get(tag, local_map["pad"]) for tag in seq]
+            for seq in padded_part],
             dtype=torch.long,
         )
 
@@ -498,10 +722,17 @@ def initialize_dataloaders(
             max_length=cfg.max_length,
             raw_dataset_path=None,
         )
+        
+        name = canonical_name(split_cfg.dataset)
+        system = name if name in USES_SYSTEM else None
+
+        def collate_with_system(batch):
+            return collate(batch, system=system)
+
         return DataLoader(
             ds,
             batch_size=split_cfg.batch_size,
-            collate_fn=collate,
+            collate_fn=collate_with_system,
             num_workers=split_cfg.num_workers,
             pin_memory=(device == "cuda"),
             persistent_workers=(split_cfg.num_workers > 0),
