@@ -371,6 +371,18 @@ class Counts(dict):
                 result.data[c] = self.data[c] / total if total > 0 else 0.0
         return result
     
+    def top_k(self, k: int) -> dict:
+        sorted_items = sorted(
+            ((c, self.data[c]) for c in self.classes if c != self.pad),
+            key=lambda x: x[1],
+            reverse=True
+        )
+        top_k_items = sorted_items[:k]
+        if self.classes_str is not None:
+            top_k_items = [(self.classes_str[int(id_)], value) for id_, value in top_k_items]
+        return dict(top_k_items)
+        
+    
 def new_counts(
         dataset_name: str,
         gates: torch.Tensor,

@@ -9,16 +9,10 @@ from tqdm import tqdm
 
 
 def should_disable_tqdm(
+    runtime_cfg: dict,
 ) -> bool:
     """Return True when tqdm progress bars should be disabled."""
-    override = os.environ.get("DISABLE_TQDM")
-    if override is not None:
-        return override.strip().lower() not in {"0", "false", "no", "off"}
-
-    try:
-        return not sys.stderr.isatty()
-    except Exception:
-        return True
+    return os.environ.get("DISABLE_TQDM") or runtime_cfg.grid_mode
 
 
 class TqdmLoggingHandler(logging.Handler):

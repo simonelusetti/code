@@ -29,6 +29,9 @@ ALIASES: dict[str, set[str]] = {
     "treebank": {"treebank", "tb"},
 }
 
+ALIASES["parasci"] = {"parasci"}
+ALIASES["parasci-concat"] = {"parasci-concat", "parasci_concat"}
+
 DATASETS_DEFAULT_CONFIG = {
     "wikiann": {
         "language": "en",
@@ -44,6 +47,9 @@ DATASETS_DEFAULT_CONFIG = {
     "treebank": None,
 }
 
+DATASETS_DEFAULT_CONFIG["parasci"] = None
+DATASETS_DEFAULT_CONFIG["parasci-concat"] = None
+
 ALIASES["nps_chat"] = {"nps_chat","nps","chat","npschat"}
 DATASETS_DEFAULT_CONFIG["nps_chat"] = None
 
@@ -53,24 +59,27 @@ NER_FALSE_NAMES = {
 }
 
 USES_SYSTEM = {"ud", "conll2000", "brown", "treebank", "nps_chat"}
-
 POS_SYSTEMS = {
     "ud": {
         "NOUN": "thing", "PROPN": "thing", "PRON": "thing",
         "VERB": "action", "AUX": "action",
-        "ADJ": "thing", "ADV": "action",
-        "ADP": "syntax", "DET": "thing", "CCONJ": "syntax", "SCONJ": "syntax",
-        "NUM": "thing", "PART": "syntax", "PUNCT": "syntax", "SYM": "symbol",
-        "_": "syntax",  "INTJ": "other", "X": "other",
-    },
-
-    "spacy": {
-        "NOUN": "thing", "PROPN": "thing", "PRON": "thing",
-        "VERB": "action", "AUX": "action",
-        "ADJ": "action", "ADV": "action",
-        "ADP": "other", "DET": "other", "CCONJ": "other",
+        "ADJ": "action",          # was "thing"
+        "ADV": "action",
+        "ADP": "syntax",
+        "DET": "syntax",          # was "thing"
+        "CCONJ": "syntax",
+        "SCONJ": "syntax",
+        "NUM": "thing",
+        "PART": "syntax",
+        "PUNCT": "syntax",
+        "SYM": "syntax",
+        "_": "syntax",
+        "INTJ": "other",
+        "X": "other",
     },
 }
+
+POS_SYSTEMS["spacy"] = POS_SYSTEMS["ud"]
 
 POS_SYSTEMS["conll2000"] = {
     # THINGS
@@ -100,21 +109,23 @@ POS_SYSTEMS["conll2000"] = {
     "(": "syntax", ")": "syntax",
     "#": "syntax", "$": "syntax",
 
-    # OTHER (not syntax)
-    "CD": "other",
-    "EX": "other",
-    "FW": "other",
-    "LS": "other",
+    # OTHER (more semantically precise)
+    "CD": "thing",    # was other
+    "FW": "thing",    # was other
+    "EX": "syntax",   # was other
+    "LS": "syntax",   # was other
     "SYM": "other",
     "UH": "other",
 }
 
-POS_SYSTEMS["treebank"] = POS_SYSTEMS["conll2000"]
-POS_SYSTEMS["treebank"]["-NONE-"] = "other"
-POS_SYSTEMS["treebank"]["-LRB-"] = "syntax"
-POS_SYSTEMS["treebank"]["-RRB-"] = "syntax"
-POS_SYSTEMS["treebank"]["-LCB-"] = "syntax"
-POS_SYSTEMS["treebank"]["-RCB-"] = "syntax"
+POS_SYSTEMS["treebank"] = {
+    **POS_SYSTEMS["conll2000"],
+    "-NONE-": "other",
+    "-LRB-": "syntax",
+    "-RRB-": "syntax",
+    "-LCB-": "syntax",
+    "-RCB-": "syntax",
+}
 
 POS_SYSTEMS["brown"] = {
     "NOUN": "thing",
@@ -127,34 +138,80 @@ POS_SYSTEMS["brown"] = {
     "ADJ": "action",
     "ADV": "action",
 
-    "ADP": "syntax",   # prepositions
-    "CONJ": "syntax",  # coordinating conjunctions
-    "SCONJ": "syntax", # subordinating conjunctions
-    "PART": "syntax",  # particles
-    "DET": "thing",    # keep like your UD mapping
+    "ADP": "syntax",
+    "CONJ": "syntax",
+    "SCONJ": "syntax",
+    "PART": "syntax",
+
+    "DET": "thing",
     "NUM": "thing",
 
     "PUNCT": "syntax",
     "PRT": "syntax",
     ".": "syntax",
+
     "SYM": "other",
     "INTJ": "other",
     "X": "other",
 }
 
 POS_SYSTEMS["nps_chat"] = {
-    **POS_SYSTEMS["conll2000"],       # reuse existing mapping
-    "EMO": "other",                    # emoticons (e.g. ":)"; appears in NPS)
-    "URL": "other",                     # URLs (appears in NPS)
-    "^NNS": "other",  
-    "^NN": "other",
-    "BES": "other",
-    "^VB": "other",
-    "^RB": "other",
-    "^VBZ": "other",      
-    "^VBP": "other",     
-    "^VBG": "other", 
+    **POS_SYSTEMS["conll2000"],
+
+    # Custom NPS Chat tags
+    "EMO": "other",
+    "URL": "other",
+    "GW": "other",
+    "HVS": "action",   # was other
+    "X": "other",
+
+    # Emphatic / uppercase → same as base
+    "^NN":  "thing",
+    "^NNS": "thing",
+    "^NNP": "thing",
+
+    "^JJ":  "action",
+    "^JJR": "action",
+    "^JJS": "action",
+
+    "^RB":  "action",
+    "^WRB": "action",
+
+    "^VB":  "action",
+    "^VBD": "action",
+    "^VBN": "action",
+    "^VBG": "action",
+    "^VBP": "action",
+    "^VBZ": "action",
+
+    # Function words
+    "^DT": "syntax",
+    "^IN": "syntax",
+    "^CC": "syntax",
+    "^TO": "syntax",
+    "^MD": "syntax",
+    "^POS": "syntax",
+    "^RP": "syntax",
+    "^UH": "syntax",
+    "^WP": "syntax",
+
+    # Pronouns
+    "^PRP":  "thing",
+    "^PRP$": "thing",
+
+    # Mixed
+    "^PRP^VBP": "other",
+
+    # caret punctuation
+    "^.": "syntax",
+
+    # Verb "BES"
+    "BES": "action",
+
+    # empty tag
+    "": "other",
 }
+
 UNKNOWN_POS = set()
 
 PART_TO_ID_BY_SYSTEM = {}
@@ -311,6 +368,14 @@ def resolve_dataset(
     if name == "conll2003":
         ds = load_from_disk(str(raw_split_path)) if raw_split_path is not None else load_dataset("conll2003", split=split)
         return ds, lambda x: x["tokens"]
+    
+    if name == "parasci":
+        ds = load_from_disk(to_absolute_path("./data/cache/parasci"))
+        return ds[split], lambda x: x["text"]
+
+    if name == "parasci-concat":
+        ds = load_from_disk(to_absolute_path("./data/cache/parasci-concat"))
+        return ds[split], lambda x: x["text"]
 
     if name == "ud":
         text_fn = lambda x: x["tokens"]
@@ -524,7 +589,10 @@ def encode_examples(
 
         return out_dict
 
-    return ds.map(_tokenize_and_encode, remove_columns=ds.column_names, batched=False)
+    return ds.map(
+        _tokenize_and_encode,
+        remove_columns=ds.column_names,
+        batched=False)
 
 
 # ---------------------------------------------------------------------------
@@ -549,7 +617,7 @@ def build_dataset(
         raw_dataset_path=raw_dataset_path,
     )
     
-    if not bool(UNKNOWN_POS):
+    if bool(UNKNOWN_POS):
         unknown_list = sorted(list(UNKNOWN_POS))
         raise ValueError(f"Unknown POS tags encountered: {unknown_list}")
     
