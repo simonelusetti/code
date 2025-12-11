@@ -4,11 +4,9 @@ __version__ = "0.1.0"
 
 from .data import (
     canonical_name,
-    collate,
     dataset_filename,
     dataset_path,
     initialize_dataloaders,
-    map_pos_to_group,
     sanitize_fragment,
     subset_and_shuffle,
     build_dataset,
@@ -35,7 +33,6 @@ from .utils import (
     merge_spans,
     merge_subwords,
     metrics_from_counts,
-    prepare_batch,
     resolve_aggregate_fn,
     sbert_encode,
 )
@@ -59,7 +56,6 @@ __all__ = [
     "hardkuma_sample",
     "initialize_dataloaders",
     "load_sbert",
-    "make_loss_table",
     "make_slot_table",
     "make_table",
     "map_pos_to_group",

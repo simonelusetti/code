@@ -8,7 +8,7 @@ import torch
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModel
 
-from .data import CATH_TO_ID, PART_TO_ID_BY_SYSTEM, canonical_name
+from .data import PAD_TAG
 
 def resolve_aggregate_fn(
     name: str,
@@ -165,7 +165,9 @@ def configure_runtime(
 ) -> None:
     runtime = cfg.runtime
     num_threads = runtime.num_threads
-    os.environ["TOKEN_PARALLELISM"] = str(runtime.token_parallelism)
+    # Disable HuggingFace tokenizers parallelism unless explicitly requested.
+    os.environ["TOKENIZERS_PARALLELISM"] = str(bool(runtime.token_parallelism)).lower()
+
     if not num_threads:
         return
     try:
@@ -208,22 +210,6 @@ def ensure_finite(
     raise RuntimeError(
         f"Non-finite {name} at node {node.path}; stats min/max/mean={stats}; sample bad idx={bad_idx}"
     )
-
-
-def prepare_batch(
-    batch: dict[str, torch.Tensor],
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    embeddings = batch["embeddings"].to(device, non_blocking=True)
-    attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-    extra = {}
-    if batch["ner_tags"] is not None:
-        extra["ner_tags"] = batch["ner_tags"]
-    if batch["cath_tags"] is not None:
-        extra["cath_tags"] = batch["cath_tags"]
-    if batch["part_tags"] is not None:
-        extra["part_tags"] = batch["part_tags"]
-    return embeddings, attention_mask, batch["tokens"], extra
 
 
 def load_sbert(
@@ -301,12 +287,25 @@ def format_dict(d, new_liners=None):
     return "\n".join(lines)
 
 
+def to_tensor(value, dtype):
+    if isinstance(value, torch.Tensor):
+        return value.to(dtype=dtype)
+    return torch.tensor(value, dtype=dtype)
+
+
+def pad_str_lists(list_of_lists, pad_value):
+    max_len = max(len(x) for x in list_of_lists)
+    return [
+        x + [pad_value] * (max_len - len(x))
+        for x in list_of_lists
+    ]
+
+
 class Counts(dict):
     def __init__(
         self, 
-        classes: list,
+        classes: Dict[str, int],
         pad: int,
-        classes_str: dict | None = None,
         classes_mask: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
     ) -> None:
@@ -314,7 +313,6 @@ class Counts(dict):
         self.data = {}
         self.pad = pad
         self.classes = classes
-        self.classes_str = classes_str
         if classes_mask is None:
             for c in self.classes:
                 if c != self.pad:
@@ -322,13 +320,13 @@ class Counts(dict):
         else:
             for c in self.classes:
                 if c != self.pad:
-                    self.data[c] = ((classes_mask == c) & mask).sum().item()
+                    self.data[c] = ((classes_mask == self.classes[c]) & mask).sum().item()
 
     def __add__(self, other: Counts) -> Counts:
         if not isinstance(other, Counts):
             raise ValueError("Can only add Counts to Counts.")
 
-        result = Counts(self.classes, self.pad, classes_str=self.classes_str)
+        result = Counts(self.classes, self.pad)
         for c in self.classes:
             if c != self.pad:
                 result.data[c] = self.data[c] + other.data[c]
@@ -338,7 +336,7 @@ class Counts(dict):
         if not isinstance(other, Counts):
             raise ValueError("Can only divide Counts by Counts.")
 
-        result = Counts(self.classes, self.pad, classes_str=self.classes_str)
+        result = Counts(self.classes, self.pad)
         for c in self.classes:
             if c != self.pad:
                 if other.data[c] == 0:
@@ -352,68 +350,19 @@ class Counts(dict):
             **{f"{k}": v for k, v in self.data.items()},
         }
         sorted_dict = dict(sorted(data_dict.items(), key=lambda x: x[1], reverse=True))
-        if self.classes_str is not None:
-            sorted_dict = {self.classes_str[int(id_)]: value for id_, value in sorted_dict.items()}
         return format_dict(sorted_dict)
     
     def preferences_over_total(self, total: int) -> Counts:
-        result = Counts(self.classes, self.pad, classes_str=self.classes_str)
+        result = Counts(self.classes, self.pad)
         for c in self.classes:
             if c != self.pad:
                 result.data[c] = self.data[c] / total if total > 0 else 0.0
         return result
     
     def preferences(self) -> Counts:
-        result = Counts(self.classes, self.pad, classes_str=self.classes_str)
+        result = Counts(self.classes, self.pad)
         total = sum(self.data[c] for c in self.classes if c != self.pad)
         for c in self.classes:
             if c != self.pad:
                 result.data[c] = self.data[c] / total if total > 0 else 0.0
         return result
-    
-    def top_k(self, k: int) -> dict:
-        sorted_items = sorted(
-            ((c, self.data[c]) for c in self.classes if c != self.pad),
-            key=lambda x: x[1],
-            reverse=True
-        )
-        top_k_items = sorted_items[:k]
-        if self.classes_str is not None:
-            top_k_items = [(self.classes_str[int(id_)], value) for id_, value in top_k_items]
-        return dict(top_k_items)
-        
-    
-def new_counts(
-        dataset_name: str,
-        gates: torch.Tensor,
-        attention_mask: torch.Tensor,
-        extra: Dict,
-        local_part_to_id: Dict,
-        device: torch.device,
-        cath_str: dict, 
-        part_str: dict,
-    ) -> Tuple[Counts, Counts, Counts, Counts, int]:
-        PAD_CATH = CATH_TO_ID["pad"]
-        PAD_PART = local_part_to_id["pad"]
-        local_part_to_id = PART_TO_ID_BY_SYSTEM[
-            canonical_name(dataset_name)
-        ]
-
-        # flatten
-        attn = attention_mask.bool().view(-1)
-        preds = (gates > 0.5).bool().view(-1)
-
-        # integer tensors, shape (B, L)
-        cath_tags = extra["cath_tags"].to(device)
-        part_tags = extra["part_tags"].to(device)
-
-        flat_cath = cath_tags.view(-1)
-        flat_part = part_tags.view(-1)
-
-        new_gold_cath = Counts(CATH_TO_ID.values(), PAD_CATH, classes_mask=flat_cath, mask=attn, classes_str=cath_str)
-        new_pred_cath = Counts(CATH_TO_ID.values(), PAD_CATH, classes_mask=flat_cath, mask=attn & preds, classes_str=cath_str)
-
-        new_gold_part = Counts(local_part_to_id.values(), PAD_PART, classes_mask=flat_part, mask=attn, classes_str=part_str)
-        new_pred_part = Counts(local_part_to_id.values(), PAD_PART, classes_mask=flat_part, mask=attn & preds, classes_str=part_str)
-        
-        return new_pred_cath, new_gold_cath, new_pred_part, new_gold_part, preds.sum().item()

@@ -1,19 +1,17 @@
 from __future__ import annotations
 
-import logging, gzip, nltk
+import logging, gzip, torch, json 
+
+from sentence_transformers import SentenceTransformer
 from pathlib import Path
 from typing import Callable, Optional, Tuple
-
-import torch
 from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 from dora import to_absolute_path
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from transformers import AutoModel, AutoTokenizer
 from urllib.request import urlretrieve
 from conllu import parse_incr
-from nltk.corpus import brown, treebank
-
 
 # ---------------------------------------------------------------------------
 # Constants & mappings
@@ -58,183 +56,8 @@ NER_FALSE_NAMES = {
     "conll2003": "O",
 }
 
-USES_SYSTEM = {"ud", "conll2000", "brown", "treebank", "nps_chat"}
-POS_SYSTEMS = {
-    "ud": {
-        "NOUN": "thing", "PROPN": "thing", "PRON": "thing",
-        "VERB": "action", "AUX": "action",
-        "ADJ": "action",          # was "thing"
-        "ADV": "action",
-        "ADP": "syntax",
-        "DET": "syntax",          # was "thing"
-        "CCONJ": "syntax",
-        "SCONJ": "syntax",
-        "NUM": "thing",
-        "PART": "syntax",
-        "PUNCT": "syntax",
-        "SYM": "syntax",
-        "_": "syntax",
-        "INTJ": "other",
-        "X": "other",
-    },
-}
-
-POS_SYSTEMS["spacy"] = POS_SYSTEMS["ud"]
-
-POS_SYSTEMS["conll2000"] = {
-    # THINGS
-    "NN": "thing", "NNS": "thing", "NNP": "thing", "NNPS": "thing",
-    "PRP": "thing", "PRP$": "thing",
-    "WP": "thing", "WP$": "thing",
-
-    # ACTIONS
-    "VB": "action", "VBD": "action", "VBG": "action",
-    "VBN": "action", "VBP": "action", "VBZ": "action",
-    "JJ": "action", "JJR": "action", "JJS": "action",
-    "RB": "action", "RBR": "action", "RBS": "action",
-    "WRB": "action",
-
-    # SYNTAX (true function words)
-    "IN": "syntax",
-    "DT": "syntax",
-    "PDT": "syntax",
-    "CC": "syntax",
-    "MD": "syntax",
-    "POS": "syntax",
-    "RP": "syntax",
-    "TO": "syntax",
-    "WDT": "syntax",
-    "``": "syntax", "''": "syntax",
-    ",": "syntax", ".": "syntax", ":": "syntax",
-    "(": "syntax", ")": "syntax",
-    "#": "syntax", "$": "syntax",
-
-    # OTHER (more semantically precise)
-    "CD": "thing",    # was other
-    "FW": "thing",    # was other
-    "EX": "syntax",   # was other
-    "LS": "syntax",   # was other
-    "SYM": "other",
-    "UH": "other",
-}
-
-POS_SYSTEMS["treebank"] = {
-    **POS_SYSTEMS["conll2000"],
-    "-NONE-": "other",
-    "-LRB-": "syntax",
-    "-RRB-": "syntax",
-    "-LCB-": "syntax",
-    "-RCB-": "syntax",
-}
-
-POS_SYSTEMS["brown"] = {
-    "NOUN": "thing",
-    "PROPN": "thing",
-    "PRON": "thing",
-
-    "VERB": "action",
-    "AUX": "action",
-
-    "ADJ": "action",
-    "ADV": "action",
-
-    "ADP": "syntax",
-    "CONJ": "syntax",
-    "SCONJ": "syntax",
-    "PART": "syntax",
-
-    "DET": "thing",
-    "NUM": "thing",
-
-    "PUNCT": "syntax",
-    "PRT": "syntax",
-    ".": "syntax",
-
-    "SYM": "other",
-    "INTJ": "other",
-    "X": "other",
-}
-
-POS_SYSTEMS["nps_chat"] = {
-    **POS_SYSTEMS["conll2000"],
-
-    # Custom NPS Chat tags
-    "EMO": "other",
-    "URL": "other",
-    "GW": "other",
-    "HVS": "action",   # was other
-    "X": "other",
-
-    # Emphatic / uppercase → same as base
-    "^NN":  "thing",
-    "^NNS": "thing",
-    "^NNP": "thing",
-
-    "^JJ":  "action",
-    "^JJR": "action",
-    "^JJS": "action",
-
-    "^RB":  "action",
-    "^WRB": "action",
-
-    "^VB":  "action",
-    "^VBD": "action",
-    "^VBN": "action",
-    "^VBG": "action",
-    "^VBP": "action",
-    "^VBZ": "action",
-
-    # Function words
-    "^DT": "syntax",
-    "^IN": "syntax",
-    "^CC": "syntax",
-    "^TO": "syntax",
-    "^MD": "syntax",
-    "^POS": "syntax",
-    "^RP": "syntax",
-    "^UH": "syntax",
-    "^WP": "syntax",
-
-    # Pronouns
-    "^PRP":  "thing",
-    "^PRP$": "thing",
-
-    # Mixed
-    "^PRP^VBP": "other",
-
-    # caret punctuation
-    "^.": "syntax",
-
-    # Verb "BES"
-    "BES": "action",
-
-    # empty tag
-    "": "other",
-}
-
-UNKNOWN_POS = set()
-
-PART_TO_ID_BY_SYSTEM = {}
-CATH_TO_ID = {"thing": 0, "action": 1, "other": 2, "syntax": 3, "pad": 4}
-
-ID_TO_CATH = {idx: tag for tag, idx in CATH_TO_ID.items()}
-
-for system_name, mapping in POS_SYSTEMS.items():
-    tags = sorted(mapping.keys())
-    local_map = {tag: i for i, tag in enumerate(tags)}
-    local_map["pad"] = len(local_map)
-    PART_TO_ID_BY_SYSTEM[system_name] = local_map
-
-ID_TO_PART_BY_SYSTEM = {
-    system: {idx: tag for tag, idx in tag_to_id.items()}
-    for system, tag_to_id in PART_TO_ID_BY_SYSTEM.items()
-}
-
-def map_pos_to_group(pos: str, system: str) -> str:
-    mapping = POS_SYSTEMS.get(system, {})
-    if pos in mapping:
-        return mapping[pos]
-    UNKNOWN_POS.add((system, pos))
+PAD_TAG = "<PAD_TAG>"
+POS_TAGSET = {PAD_TAG}
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -296,18 +119,7 @@ def subset_and_shuffle(ds: Dataset, subset: int | float = 1.0, shuffle: bool = F
 def load_nltk_pos_corpus(
     corpus_name: str,
     corpus_loader: Callable[[], list[list[tuple[str, str]]]],
-    pos_system: str,
 ) -> Dataset:
-    """
-    Generic loader for NLTK POS-tagged corpora.
-    Args:
-        corpus_name: name to show in errors / download messages
-        corpus_loader: function that returns a list of tagged sentences:
-                       e.g. lambda: brown.tagged_sents(tagset="universal")
-        pos_system: key into POS_SYSTEMS (e.g. "brown", "treebank", "nps_chat")
-    Returns:
-        A HuggingFace Dataset with {tokens, part_tags, cath_tags}
-    """
     import nltk
     try:
         tagged = corpus_loader()
@@ -319,105 +131,202 @@ def load_nltk_pos_corpus(
 
     sentences = []
     for sent in tagged:
-        tokens = [w for (w, _) in sent]
-        pos_tags = [t for (_, t) in sent]
-        cath_tags = [map_pos_to_group(t, pos_system) for t in pos_tags]
-
         sentences.append({
-            "tokens": tokens,
-            "part_tags": pos_tags,
-            "cath_tags": cath_tags,
+            "tokens": [w for (w, _) in sent],
+            "pos": [t for (_, t) in sent],
         })
-
     return Dataset.from_list(sentences)
 
+            
+# ---------------------------------------------------------------------------
+# Builder functions
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Dataset resolution (raw → HF Dataset)
-# ---------------------------------------------------------------------------
+
+def collate_with_map(pos_map: dict) -> Callable:
+    from .utils import pad_str_lists, to_tensor
+    def collate(batch: list[dict]) -> dict[str, torch.Tensor | list[list[str]]]:
+        input_ids = pad_sequence(
+            [to_tensor(item["input_ids"], torch.long) for item in batch],
+            batch_first=True,
+            padding_value=0,
+        )
+        attention_masks = pad_sequence(
+            [to_tensor(item["attention_mask"], torch.long) for item in batch],
+            batch_first=True,
+            padding_value=0,
+        )
+        embeddings = pad_sequence(
+            [to_tensor(item["embeddings"], torch.float32) for item in batch],
+            batch_first=True,
+            padding_value=0.0,
+        )
+        sentence_reps = torch.stack(
+            [to_tensor(item["sentence_rep"], torch.float32) for item in batch],
+            dim=0,
+        )
+        labels = None
+        if "labels" in batch[0]:
+            if isinstance(batch[0]["labels"][0], bool):
+                labels = pad_sequence(
+                    [to_tensor(item["labels"], torch.long) for item in batch],
+                    batch_first=True,
+                    padding_value=-100,  # ignore_index
+                )
+            else:
+                raw_pos = [item["labels"] for item in batch]
+                padded_pos = pad_str_lists(raw_pos, pad_value=PAD_TAG)
+                pad_idx = pos_map[PAD_TAG]
+                labels = torch.tensor(
+                    [[pos_map.get(tag, pad_idx) for tag in seq]
+                    for seq in padded_pos],
+                    dtype=torch.long,
+                )            
+
+        return {
+            "embeddings": embeddings,
+            "attention_mask": attention_masks,
+            "sentence_reps": sentence_reps,
+            "input_ids": input_ids,
+            "tokens": [item["tokens"] for item in batch],
+            "labels": labels,
+        }
+        
+    return collate
+
+
+def encode_examples(
+    shared_cfg: dict,
+    ds: Dataset,
+    text_fn: Callable,
+) -> Dataset:
+    from .utils import sbert_encode
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    sbert = SentenceTransformer(shared_cfg["sentence_model_name"])
+    tok = AutoTokenizer.from_pretrained(shared_cfg.tokenizer_name, use_fast=True)
+    encoder = freeze_encoder(AutoModel.from_pretrained(shared_cfg.tokenizer_name))
+    
+    def _tokenize_and_encode(example, sbert):
+        text = text_fn(example)
+        
+        enc = tok(text,truncation=True,max_length=shared_cfg["max_length"],
+            is_split_into_words=isinstance(text, (list, tuple)))
+        
+        input_ids = torch.tensor(enc["input_ids"], device=device).unsqueeze(0)
+        attention_mask = torch.tensor(enc["attention_mask"], device=device).unsqueeze(0)
+        with torch.no_grad():
+            out = encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_attentions=False,
+                return_dict=True,
+            )
+
+        labels_name = {"pos", "ner"} & example.keys()
+        aligned_labels = []
+        if labels_name:
+            word_ids = enc.word_ids()
+            labels_name = labels_name.pop()
+            labels = example[labels_name]
+            if labels_name == "pos":
+                POS_TAGSET.update(labels)
+            for wid in word_ids:
+                if wid is None and labels_name == "pos":
+                    aligned_labels.append(PAD_TAG)  
+                elif wid is None and labels_name == "ner":
+                    aligned_labels.append(False)
+                elif labels_name == "pos":
+                    aligned_labels.append(str(labels[wid]))
+                elif labels_name == "ner":
+                    aligned_labels.append(labels[wid] == 'O')
+
+        return {
+            "input_ids": enc["input_ids"],                           
+            "attention_mask": enc["attention_mask"],                 
+            "embeddings": out.last_hidden_state.squeeze(0).cpu().to(torch.float32).tolist(),                      
+            "tokens": tok.convert_ids_to_tokens(enc["input_ids"]),
+            "sentence_rep": sbert_encode(sbert, out.last_hidden_state, attention_mask).detach(),
+            "labels": aligned_labels if labels_name else None,
+        }
+
+    return ds.map(
+        lambda example: _tokenize_and_encode(example, sbert),
+        remove_columns=ds.column_names,
+        batched=False)
+
 
 def resolve_dataset(
-    name: str,
-    split: str,
-    dataset_config: dict = DATASETS_DEFAULT_CONFIG["wikiann"],
-    raw_dataset_path: Optional[str] = None,
+    cfg: dict,
+    raw_dataset_path: Optional[str],
 ) -> Tuple[Dataset, Callable]:
     """
     Returns (dataset, text_fn) where text_fn(example) -> tokens or text.
     """
-    name = canonical_name(name)
-
-    raw_split_path = None
+    name = canonical_name(cfg["dataset"])
+    ds = None
+    text_fn = None
+    
     if raw_dataset_path is not None:
         raw_root = Path(raw_dataset_path)
-        raw_split_path = raw_root / split
-        if not raw_split_path.exists() and name != "ud":
+        raw_split_path = raw_root / cfg["split"]
+        if not raw_split_path.exists():
             raise FileNotFoundError(f"Raw dataset split not found at {raw_split_path}")
+        ds = load_from_disk(str(raw_split_path))
 
     if name == "cnn_dailymail":
-        version = dataset_config.get("version") if dataset_config is not None else DATASETS_DEFAULT_CONFIG["cnn_dailymail"]["version"]
-        ds = load_from_disk(str(raw_split_path)) if raw_split_path is not None else load_dataset("cnn_dailymail", version, split=split)
-        target_field = dataset_config.get("field") if dataset_config is not None else DATASETS_DEFAULT_CONFIG["cnn_dailymail"]["field"]
-        return ds, lambda x: x[target_field]
+        if ds is None:
+            ds = load_dataset("cnn_dailymail", cfg["config"]["version"], split=cfg["config"]["split"])
+        return ds, lambda x: x[cfg["config"]["field"]]
 
     if name == "wikiann":
-        config_name = dataset_config.get("language") if dataset_config is not None else DATASETS_DEFAULT_CONFIG["wikiann"]["language"]
-        ds = load_from_disk(str(raw_split_path)) if raw_split_path is not None else load_dataset("wikiann", config_name, split=split)
+        if ds is None:
+            ds = load_dataset("wikiann", cfg["config"]["language"], split=cfg["config"]["split"])
         return ds, lambda x: x["tokens"]
 
     if name == "conll2003":
-        ds = load_from_disk(str(raw_split_path)) if raw_split_path is not None else load_dataset("conll2003", split=split)
+        if ds is None:
+            ds = load_dataset("conll2003", split=cfg["config"]["split"])
         return ds, lambda x: x["tokens"]
     
     if name == "parasci":
         ds = load_from_disk(to_absolute_path("./data/cache/parasci"))
-        return ds[split], lambda x: x["text"]
+        return ds[cfg["split"]], lambda x: x["text"]
 
     if name == "parasci-concat":
         ds = load_from_disk(to_absolute_path("./data/cache/parasci-concat"))
-        return ds[split], lambda x: x["text"]
-
+        return ds[cfg["split"]], lambda x: x["text"]
+    
     if name == "ud":
         text_fn = lambda x: x["tokens"]
-
-        if raw_split_path is not None:
-            ds = load_from_disk(raw_split_path)
+        if ds is not None:
             return ds, text_fn
-
         files = {
             "train": "en_ewt-ud-train.conllu",
             "validation": "en_ewt-ud-dev.conllu",
             "test": "en_ewt-ud-test.conllu",
         }
         base_url = "https://raw.githubusercontent.com/UniversalDependencies/UD_English-EWT/master/"
-
         raw_root = Path(to_absolute_path("./data/raw/ud"))
         raw_root.mkdir(parents=True, exist_ok=True)
-
         split_paths: dict[str, Path] = {}
         for sp, fname in files.items():
             local = raw_root / fname
             split_paths[sp] = local
             if not local.exists():
                 urlretrieve(base_url + fname, local)
-
         def load_conllu(path: Path | str) -> list[dict[str, list]]:
             sentences = []
             with open(path, "r", encoding="utf-8") as f:
                 for sent in parse_incr(f):
-                    tokens = [tok["form"] for tok in sent]
-                    part_labels = [tok["upos"] for tok in sent]
-                    cath_labels = [map_pos_to_group(pos, "ud") for pos in part_labels]
                     sentences.append({
-                        "tokens": tokens,
-                        "cath_tags": cath_labels,
-                        "part_tags": part_labels
+                        "tokens": [tok["form"] for tok in sent],
+                        "pos": [tok["upos"] for tok in sent]
                     })
             return sentences
-
         datasets_dict = {sp: load_conllu(path) for sp, path in split_paths.items()}
         ds = DatasetDict({sp: Dataset.from_list(data) for sp, data in datasets_dict.items()})
-        return ds[split], text_fn
+        return ds[cfg["split"]], text_fn
     
     if name == "conll2000":
         # Download  
@@ -429,10 +338,10 @@ def resolve_dataset(
         }
         raw_root = Path(to_absolute_path("./data/raw/conll2000"))
         raw_root.mkdir(parents=True, exist_ok=True)
-        gz_path = raw_root / files[split]
-        txt_path = raw_root / files[split].replace(".gz", "")
+        gz_path = raw_root / files[cfg["split"]]
+        txt_path = raw_root / files[cfg["split"]].replace(".gz", "")
         if not gz_path.exists():
-            urlretrieve(base_url + files[split], gz_path)
+            urlretrieve(base_url + files[cfg["split"]], gz_path)
         if not txt_path.exists():
             with gzip.open(gz_path, "rt", encoding="utf-8") as f_in, \
                  open(txt_path, "w", encoding="utf-8") as f_out:
@@ -440,13 +349,10 @@ def resolve_dataset(
                     f_out.write(line)
         # Parse
         def _format_sentence(tokens, pos_tags):
-            cath = [map_pos_to_group(p, "conll2000") for p in pos_tags]
             return{
                 "tokens": tokens,
-                "part_tags": pos_tags,
-                "cath_tags": cath,
+                "pos": pos_tags,
             }
-            
         tokens, pos_tags, sentences = [], [], []
         with open(txt_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -465,353 +371,136 @@ def resolve_dataset(
                 pos_tags.append(pos)
         if len(tokens) > 0:
             sentences.append(_format_sentence(tokens, pos_tags))
-
         ds = Dataset.from_list(sentences)
         return ds, lambda x: x["tokens"]
     
     if name == "brown":
-        from nltk.corpus import brown
-        ds = load_nltk_pos_corpus(
-            corpus_name="brown",
-            corpus_loader=lambda: brown.tagged_sents(tagset="universal"),
-            pos_system="brown",
-        )
+        if ds is None:
+            from nltk.corpus import brown
+            ds = load_nltk_pos_corpus(
+                corpus_name="brown",
+                corpus_loader=lambda: brown.tagged_sents(tagset="universal"),
+            )
         return ds, lambda x: x["tokens"]
 
     if name == "treebank":
-        from nltk.corpus import treebank
-        ds = load_nltk_pos_corpus(
-            corpus_name="treebank",
-            corpus_loader=lambda: treebank.tagged_sents(),
-            pos_system="treebank",
-        )
+        if ds is None:
+            from nltk.corpus import treebank
+            ds = load_nltk_pos_corpus(
+                corpus_name="treebank",
+                corpus_loader=lambda: treebank.tagged_sents(),
+            )
         return ds, lambda x: x["tokens"]
 
     if name == "nps_chat":
-        from nltk.corpus import nps_chat
-        ds = load_nltk_pos_corpus(
-            corpus_name="nps_chat",
-            corpus_loader=lambda: nps_chat.tagged_posts(),
-            pos_system="nps_chat",
-        )
+        if ds is None:
+            from nltk.corpus import nps_chat
+            ds = load_nltk_pos_corpus(
+                corpus_name="nps_chat",
+                corpus_loader=lambda: nps_chat.tagged_posts(),
+            )
         return ds, lambda x: x["tokens"]
     
     raise ValueError(f"Unknown dataset name: {name}")
 
 
-# ---------------------------------------------------------------------------
-# Encoding with frozen encoder (precompute embeddings)
-# ---------------------------------------------------------------------------
-
-def encode_examples(
-    name: str,
-    ds: Dataset,
-    tok: AutoTokenizer,
-    encoder: AutoModel,
-    text_fn: Callable,
-    max_length: int,
-) -> Dataset:
-    """
-    Maps each example to:
-      - input_ids: List[int]
-      - attention_mask: List[int]
-      - embeddings: List[List[float]] (last_hidden_state)
-      - tokens: List[str] (BERT wordpiece tokens)
-      - factor_tags / ner_tags: List[int], aligned to wordpieces
-    All stored as Python lists (no numpy), tensorized later in collate().
-    """
-
-    device = next(encoder.parameters()).device
-
-    def _tokenize_and_encode(example):
-        text = text_fn(example)
-        split_into_words = isinstance(text, (list, tuple))
-
-        enc = tok(
-            text,
-            truncation=True,
-            max_length=max_length,
-            is_split_into_words=split_into_words,
-        )
-
-        # to tensors on encoder device
-        input_ids = torch.tensor(enc["input_ids"], device=device).unsqueeze(0)
-        attention_mask = torch.tensor(enc["attention_mask"], device=device).unsqueeze(0)
-
-        with torch.no_grad():
-            out = encoder(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_attentions=False,
-                return_dict=True,
-            )
-
-        # move to CPU, keep as Python lists (no numpy)
-        last_hidden = out.last_hidden_state.squeeze(0).cpu().to(torch.float32)
-
-        out_dict = {
-            "input_ids": enc["input_ids"],                           # List[int]
-            "attention_mask": enc["attention_mask"],                 # List[int]
-            "embeddings": last_hidden.tolist(),                      # List[List[float]]
-            "tokens": tok.convert_ids_to_tokens(enc["input_ids"]),   # BERT wordpieces
-        }
-
-        # POS / factor tags
-        if "cath_tags" in example and split_into_words:
-            word_ids = enc.word_ids()
-            cath_labels = example["cath_tags"] 
-            part_labels = example["part_tags"]
-            aligned_cath = []
-            aligned_part = []
-            for wid in word_ids:
-                if wid is None:
-                    aligned_cath.append("pad")  # OTHER
-                    aligned_part.append("pad")  # OTHER
-                else:
-                    aligned_cath.append(str(cath_labels[wid]))
-                    aligned_part.append(str(part_labels[wid]))
-                    
-            out_dict["cath_tags"] = aligned_cath  # List[int]
-            out_dict["part_tags"] = aligned_part  # List[int]
-
-        # NER tags: binary entity vs non-entity
-        if "ner_tags" in example and split_into_words:
-            word_ids = enc.word_ids()
-            ner_tags = example["ner_tags"]
-            aligned = []
-            false_name = NER_FALSE_NAMES.get(name, "O")
-            for wid in word_ids:
-                if wid is None:
-                    aligned.append(0)
-                else:
-                    aligned.append(0 if false_name == ner_tags[wid] else 1)
-            out_dict["ner_tags"] = aligned  # List[int]
-
-        return out_dict
-
-    return ds.map(
-        _tokenize_and_encode,
-        remove_columns=ds.column_names,
-        batched=False)
-
-
-# ---------------------------------------------------------------------------
-# Public dataset builders
-# ---------------------------------------------------------------------------
-
 def build_dataset(
-    name: str,
-    tokenizer_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-    dataset_config: dict = DATASETS_DEFAULT_CONFIG["wikiann"],
-    split: str = "train",
-    subset: int | float | None = None,
-    max_length: int = 512,
-    shuffle: bool = False,
-    raw_dataset_path: Optional[str] = None,
+    shared_cfg: dict,
+    split_cfg: dict,
+    raw_dataset_path: Optional[str],
 ) -> Dataset:
-    name = canonical_name(name)
-    full_ds, text_fn = resolve_dataset(
-        name=name,
-        split=split,
-        dataset_config=dataset_config,
-        raw_dataset_path=raw_dataset_path,
-    )
-    
-    if bool(UNKNOWN_POS):
-        unknown_list = sorted(list(UNKNOWN_POS))
-        raise ValueError(f"Unknown POS tags encountered: {unknown_list}")
-    
-    ds = subset_and_shuffle(full_ds, subset, shuffle=shuffle)
-
-    tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
-    encoder = freeze_encoder(AutoModel.from_pretrained(tokenizer_name))
-
-    ds = encode_examples(name, ds, tok, encoder, text_fn, max_length)
+    full_ds, text_fn = resolve_dataset(split_cfg, raw_dataset_path)
+    ds = subset_and_shuffle(full_ds, split_cfg.subset, shared_cfg.shuffle)
+    ds = encode_examples(shared_cfg,ds,text_fn)
     return ds
 
 
 def get_dataset(
-    tokenizer_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-    name: str = "wikiann",
-    split: str = "train",
-    dataset_config: dict | None = None,
-    subset: int | float | None = None,
-    rebuild: bool = False,
-    shuffle: bool = False,
+    shared_cfg: dict,
+    split_cfg: dict,
     logger: Optional[logging.Logger] = None,
-    max_length: int = 512,
     raw_dataset_path: Optional[str] = None,
 ) -> Dataset:
-    name = canonical_name(name)
-    path = dataset_path(name, split, dataset_config=dataset_config)
-    if dataset_config is None:
-        dataset_config = DATASETS_DEFAULT_CONFIG[name]
+    name = canonical_name(split_cfg.dataset)
+    path = dataset_path(name, split_cfg.split, dataset_config=split_cfg.get("config", None))
+    if split_cfg["config"] is None:
+        split_cfg["config"] = DATASETS_DEFAULT_CONFIG[name]
 
-    if path.exists() and not rebuild:
+    if path.exists() and not shared_cfg["rebuild"]:
         if logger is not None:
             logger.info("Loading cached dataset from %s", path)
         ds = load_from_disk(path)
-        ds = subset_and_shuffle(ds, subset, shuffle=shuffle)
+        ds = subset_and_shuffle(ds, split_cfg.subset, shuffle=shared_cfg.shuffle)
         return ds
 
     if logger is not None:
-        logger.info("Building dataset for %s/%s (subset=%s)", name, split, subset)
-
+        logger.info("Building dataset for %s/%s (subset=%s)", name, split_cfg.split, split_cfg.subset)
+        
     ds = build_dataset(
-        name=name,
-        tokenizer_name=tokenizer_name,
-        dataset_config=dataset_config,
-        split=split,
-        subset=subset,
-        max_length=max_length,
-        shuffle=shuffle,
+        shared_cfg=shared_cfg,
+        split_cfg=split_cfg,
         raw_dataset_path=raw_dataset_path,
     )
+    
+    if len(POS_TAGSET) > 1:
+        pos_map = {value: i for i, value in enumerate(sorted(POS_TAGSET))}
+        with open(to_absolute_path(path.parent / f"{name}_pos_map.json"), "w") as f:
+            json.dump(pos_map, f)
+
     path.parent.mkdir(parents=True, exist_ok=True)
     ds.save_to_disk(path)
     return ds
 
 
-# ---------------------------------------------------------------------------
-# Collate function (everything tensorized here)
-# ---------------------------------------------------------------------------
-
-def collate(batch, system: str | None = None) -> dict[str, torch.Tensor | list[list[str]]]:
-    """
-    batch: list[dict]
-    Returns tensors:
-      - input_ids:      (B, L)
-      - attention_mask: (B, L)
-      - embeddings:     (B, L, D)
-      - ner_tags:       (B, L) or None
-      - factor_tags:    (B, L) or None
-      - tokens:         list[list[str]] (kept as Python, for SBERT / gating)
-    """
-
-    def _to_tensor(value, dtype):
-        if isinstance(value, torch.Tensor):
-            return value.to(dtype=dtype)
-        # value is list (nested or flat)
-        return torch.tensor(value, dtype=dtype)
-
-    PAD_TAG = "<PAD_TAG>"
-
-    def pad_str_lists(list_of_lists, pad_value):
-        max_len = max(len(x) for x in list_of_lists)
-        return [
-            x + [pad_value] * (max_len - len(x))
-            for x in list_of_lists
-        ]
-
-    input_ids = pad_sequence(
-        [ _to_tensor(item["input_ids"], torch.long) for item in batch ],
-        batch_first=True,
-        padding_value=0,
+def build_loader(
+    shared_cfg: dict,
+    split_cfg: dict,
+    pos_map: Optional[dict],
+    device: str,
+    logger: Optional[logging.Logger],
+) -> DataLoader:
+    ds = get_dataset(shared_cfg,split_cfg,logger,None)
+    return DataLoader(
+        ds,
+        batch_size=shared_cfg.batch_size,
+        collate_fn=collate_with_map(pos_map),
+        num_workers=shared_cfg.num_workers,
+        pin_memory=(device == "cuda"),
+        persistent_workers=(shared_cfg.num_workers > 0),
+        shuffle=shared_cfg.shuffle,
     )
 
-    attention_masks = pad_sequence(
-        [ _to_tensor(item["attention_mask"], torch.long) for item in batch ],
-        batch_first=True,
-        padding_value=0,
-    )
-
-    embeddings = pad_sequence(
-        [ _to_tensor(item["embeddings"], torch.float32) for item in batch ],
-        batch_first=True,
-        padding_value=0.0,
-    )
-
-    if "ner_tags" in batch[0]:
-        ner_tags = pad_sequence(
-            [ _to_tensor(item["ner_tags"], torch.long) for item in batch ],
-            batch_first=True,
-            padding_value=-100,  # ignore_index
-        )
-
-    if "part_tags" in batch[0]:
-        if system is None:
-            raise ValueError("POS-tagged dataset but no pos_system provided by dataloader")
-
-        local_map = PART_TO_ID_BY_SYSTEM[system]
-
-        raw_part = [item["part_tags"] for item in batch]
-        padded_part = pad_str_lists(raw_part, pad_value="pad")
-
-        part_tags = torch.tensor(
-            [[local_map.get(tag, local_map["pad"]) for tag in seq]
-            for seq in padded_part],
-            dtype=torch.long,
-        )
-
-    if "cath_tags" in batch[0]:
-        raw_cath = [item["cath_tags"] for item in batch]
-        padded_cath = pad_str_lists(raw_cath, pad_value="pad")
-
-        cath_tags = torch.tensor(
-            [[CATH_TO_ID.get(tag, CATH_TO_ID["pad"]) for tag in seq]
-             for seq in padded_cath],
-            dtype=torch.long,
-        )
-
-    tokens = [item["tokens"] for item in batch]  # list[list[str]]
-
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_masks,
-        "embeddings": embeddings,
-        "tokens": tokens,
-        "ner_tags": ner_tags if "ner_tags" in batch[0] else None,
-        "cath_tags": cath_tags if "cath_tags" in batch[0] else None,
-        "part_tags": part_tags if "part_tags" in batch[0] else None,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Dataloader initialization
-# ---------------------------------------------------------------------------
 
 def initialize_dataloaders(
     cfg: dict,
     logger: Optional[logging.Logger] = None,
-    tokenizer_name: str = "sentence-transformers/all-MiniLM-L6-v2",
     device: str = "cpu",
-) -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
+) -> Tuple[DataLoader, DataLoader, Optional[DataLoader], Optional[dict]]:
+    
+    name = canonical_name(cfg.train.dataset)
+    path = dataset_path(name, cfg.train.split, dataset_config=cfg.train.get("config", None))
 
-    def build_loader(split_cfg):
-        ds = get_dataset(
-            tokenizer_name=tokenizer_name,
-            name=canonical_name(split_cfg.dataset),
-            split=split_cfg.split,
-            subset=split_cfg.subset,
-            dataset_config=split_cfg.config,
-            rebuild=cfg.rebuild_ds,
-            shuffle=split_cfg.shuffle,
-            logger=logger,
-            max_length=cfg.max_length,
-            raw_dataset_path=None,
-        )
-        
-        name = canonical_name(split_cfg.dataset)
-        system = name if name in USES_SYSTEM else None
+    try:
+        with open(to_absolute_path(path.parent / f"{name}_pos_map.json"), "r") as f:
+            pos_map = json.load(f)
+    except FileNotFoundError:
+        pos_map = None
 
-        def collate_with_system(batch):
-            return collate(batch, system=system)
-
-        return DataLoader(
-            ds,
-            batch_size=split_cfg.batch_size,
-            collate_fn=collate_with_system,
-            num_workers=split_cfg.num_workers,
+    train_dl = build_loader(cfg.shared,cfg.train,pos_map,device,logger)
+    
+    eval_dl = build_loader(cfg.shared,cfg.eval,pos_map,device,logger)
+  
+    if "dev" in cfg and cfg["dev"]["dataset"] is not None:
+        dev_dl = build_loader(cfg.shared,cfg.dev,pos_map,device,logger)
+        full_eval_ds = ConcatDataset([dev_dl.dataset, eval_dl.dataset])
+        eval_dl = DataLoader(
+            full_eval_ds,
+            batch_size=cfg.eval.batch_size,
+            collate_fn=collate_with_map(pos_map),
+            num_workers=cfg.eval.num_workers,
             pin_memory=(device == "cuda"),
-            persistent_workers=(split_cfg.num_workers > 0),
-            shuffle=split_cfg.shuffle,
+            persistent_workers=(cfg.eval.num_workers > 0),
+            shuffle=cfg.eval.shuffle,
         )
 
-    train_dl = build_loader(cfg.train)
-    eval_dl = build_loader(cfg.eval)
-
-    dev_dl = None
-    if getattr(cfg, "dev", None) is not None and cfg.dev.dataset:
-        dev_dl = build_loader(cfg.dev)
-
-    return train_dl, eval_dl, dev_dl
+    return train_dl, eval_dl, pos_map
